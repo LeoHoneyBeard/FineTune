@@ -1,0 +1,4 @@
+# Copy to local.properties and fill in your local values.
+openai.api.token=OPENAI_API_KEY_HERE
+openai.chat.model=MODEL_NAME_HERE
+openai.fine_tune.model=FINE_TUNE_BASE_MODEL_HERE
