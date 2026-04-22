@@ -124,6 +124,7 @@ private data class TranscriptMessage(
     val content: String,
     val confidenceStatus: ConfidenceStatus? = null,
     val auxiliaryLines: List<String> = emptyList(),
+    val usedStrongModel: Boolean = false,
 )
 
 private data class ChatImportItem(
@@ -132,10 +133,12 @@ private data class ChatImportItem(
     val confidenceStatus: ConfidenceStatus? = null,
     val auxiliaryLines: List<String> = emptyList(),
     val inferenceCount: Int = 0,
+    val strongModelInferenceCount: Int = 0,
     val inputTokens: Int = 0,
     val outputTokens: Int = 0,
     val error: String? = null,
     val isRunning: Boolean = false,
+    val usedStrongModel: Boolean = false,
 )
 
 private data class ChatImportMetrics(
@@ -143,10 +146,22 @@ private data class ChatImportMetrics(
     val successfulCount: Int,
     val unsuccessfulCount: Int,
     val inferenceCount: Int,
+    val strongModelInferenceCount: Int,
     val inputTokens: Int,
     val outputTokens: Int,
     val statusCounts: Map<ConfidenceStatus, Int>,
     val errorCount: Int,
+)
+
+private data class ConfidenceExecutionResult(
+    val answer: String,
+    val status: ConfidenceStatus,
+    val auxiliaryLines: List<String>,
+    val inferenceCount: Int,
+    val strongModelInferenceCount: Int,
+    val inputTokens: Int,
+    val outputTokens: Int,
+    val usedStrongModel: Boolean,
 )
 
 private data class BatchPromptItem(
@@ -164,6 +179,7 @@ private data class BatchPromptItem(
 private class DesktopClientState(
     private val client: OpenAiClient = OpenAiClient(),
 ) {
+    private val strongChatModel = "gpt-4.1"
     private val json = Json { ignoreUnknownKeys = true }
     var selectedTab by mutableStateOf(DesktopTab.CHAT)
     var systemPrompt by mutableStateOf("You are a helpful assistant.")
@@ -296,52 +312,33 @@ private class DesktopClientState(
             runCatching {
                 when (confidenceMode) {
                     ConfidenceMode.SCORING -> {
-                        client.sendScoredChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory, temperature)
-                            .also { response ->
-                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                    content = response.answer,
-                                    confidenceStatus = response.status,
-                                )
-                                appendChatLog(
-                                    buildString {
-                                        appendLine("Response #$requestId")
-                                        appendLine("Mode: Scoring")
-                                        appendLine("Status: ${response.status.name}")
-                                        appendLine("Raw answer:")
-                                        appendLine(formatLogBlock(response.rawAnswer))
-                                        appendLine("Raw API response:")
-                                        appendLine(formatLogBlock(response.rawResponse))
-                                        appendLine("Parsed answer:")
-                                        append(formatLogBlock(response.answer))
-                                    }.trimEnd()
-                                )
-                            }
-                            .answer
+                        executeConfidenceRoute(
+                            requestId = requestId,
+                            history = chatHistory,
+                            temperature = temperature,
+                            mode = ConfidenceMode.SCORING,
+                        ).also { response ->
+                            chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                content = response.answer,
+                                confidenceStatus = response.status,
+                                usedStrongModel = response.usedStrongModel,
+                            )
+                        }.answer
                     }
                     ConfidenceMode.REDUNDANCY -> {
-                        client.sendRedundantChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory, temperature)
-                            .also { response ->
-                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                    content = response.answer,
-                                    confidenceStatus = response.status,
-                                    auxiliaryLines = response.responses,
-                                )
-                                appendChatLog(
-                                    buildString {
-                                        appendLine("Response #$requestId")
-                                        appendLine("Mode: Redundancy")
-                                        appendLine("Status: ${response.status.name}")
-                                        appendLine("Responses:")
-                                        response.responses.forEachIndexed { index, item ->
-                                            appendLine("${index + 1}.")
-                                            appendLine(formatLogBlock(item))
-                                        }
-                                        appendLine("Final answer:")
-                                        append(formatLogBlock(response.answer))
-                                    }.trimEnd()
-                                )
-                            }
-                            .answer
+                        executeConfidenceRoute(
+                            requestId = requestId,
+                            history = chatHistory,
+                            temperature = temperature,
+                            mode = ConfidenceMode.REDUNDANCY,
+                        ).also { response ->
+                            chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                content = response.answer,
+                                confidenceStatus = response.status,
+                                auxiliaryLines = response.auxiliaryLines,
+                                usedStrongModel = response.usedStrongModel,
+                            )
+                        }.answer
                     }
                     null -> {
                         val answerBuilder = StringBuilder()
@@ -405,10 +402,12 @@ private class DesktopClientState(
                 confidenceStatus = null,
                 auxiliaryLines = emptyList(),
                 inferenceCount = 0,
+                strongModelInferenceCount = 0,
                 inputTokens = 0,
                 outputTokens = 0,
                 error = null,
                 isRunning = false,
+                usedStrongModel = false,
             )
         }
 
@@ -452,67 +451,54 @@ private class DesktopClientState(
                 runCatching {
                     when (val confidenceMode = selectedConfidenceMode.takeIf { isConfidenceEnabled }) {
                         ConfidenceMode.SCORING -> {
-                            client.sendScoredChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
-                                .also { response ->
-                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                        content = response.answer,
-                                        confidenceStatus = response.status,
-                                    )
-                                    chatImportItems[index] = chatImportItems[index].copy(
-                                        response = response.answer,
-                                        confidenceStatus = response.status,
-                                        inferenceCount = 1,
-                                        inputTokens = response.usage.inputTokens,
-                                        outputTokens = response.usage.outputTokens,
-                                        isRunning = false,
-                                    )
-                                    appendChatLog(
-                                        buildString {
-                                            appendLine("Response #$requestId")
-                                            appendLine("Mode: ${confidenceMode.title}")
-                                            appendLine("Status: ${response.status.name}")
-                                            appendLine("Raw answer:")
-                                            appendLine(formatLogBlock(response.rawAnswer))
-                                            appendLine("Raw API response:")
-                                            appendLine(formatLogBlock(response.rawResponse))
-                                            appendLine("Parsed answer:")
-                                            append(formatLogBlock(response.answer))
-                                        }.trimEnd()
-                                    )
-                                }
+                            executeConfidenceRoute(
+                                requestId = requestId,
+                                history = history,
+                                temperature = temperature,
+                                mode = confidenceMode,
+                            ).also { response ->
+                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                    content = response.answer,
+                                    confidenceStatus = response.status,
+                                    usedStrongModel = response.usedStrongModel,
+                                )
+                                chatImportItems[index] = chatImportItems[index].copy(
+                                    response = response.answer,
+                                    confidenceStatus = response.status,
+                                    inferenceCount = response.inferenceCount,
+                                    strongModelInferenceCount = response.strongModelInferenceCount,
+                                    inputTokens = response.inputTokens,
+                                    outputTokens = response.outputTokens,
+                                    isRunning = false,
+                                    usedStrongModel = response.usedStrongModel,
+                                )
+                            }
                         }
                         ConfidenceMode.REDUNDANCY -> {
-                            client.sendRedundantChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
-                                .also { response ->
-                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                        content = response.answer,
-                                        confidenceStatus = response.status,
-                                        auxiliaryLines = response.responses,
-                                    )
-                                    chatImportItems[index] = chatImportItems[index].copy(
-                                        response = response.answer,
-                                        confidenceStatus = response.status,
-                                        auxiliaryLines = response.responses,
-                                        inferenceCount = response.inferenceCount,
-                                        inputTokens = response.usage.inputTokens,
-                                        outputTokens = response.usage.outputTokens,
-                                        isRunning = false,
-                                    )
-                                    appendChatLog(
-                                        buildString {
-                                            appendLine("Response #$requestId")
-                                            appendLine("Mode: ${confidenceMode.title}")
-                                            appendLine("Status: ${response.status.name}")
-                                            appendLine("Responses:")
-                                            response.responses.forEachIndexed { responseIndex, text ->
-                                                appendLine("${responseIndex + 1}.")
-                                                appendLine(formatLogBlock(text))
-                                            }
-                                            appendLine("Final answer:")
-                                            append(formatLogBlock(response.answer))
-                                        }.trimEnd()
-                                    )
-                                }
+                            executeConfidenceRoute(
+                                requestId = requestId,
+                                history = history,
+                                temperature = temperature,
+                                mode = confidenceMode,
+                            ).also { response ->
+                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                    content = response.answer,
+                                    confidenceStatus = response.status,
+                                    auxiliaryLines = response.auxiliaryLines,
+                                    usedStrongModel = response.usedStrongModel,
+                                )
+                                chatImportItems[index] = chatImportItems[index].copy(
+                                    response = response.answer,
+                                    confidenceStatus = response.status,
+                                    auxiliaryLines = response.auxiliaryLines,
+                                    inferenceCount = response.inferenceCount,
+                                    strongModelInferenceCount = response.strongModelInferenceCount,
+                                    inputTokens = response.inputTokens,
+                                    outputTokens = response.outputTokens,
+                                    isRunning = false,
+                                    usedStrongModel = response.usedStrongModel,
+                                )
+                            }
                         }
                         null -> {
                             client.sendChatCompletionDetailed(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
@@ -808,6 +794,175 @@ private class DesktopClientState(
         }
     }
 
+    private suspend fun executeConfidenceRoute(
+        requestId: Int,
+        history: List<ChatTurn>,
+        temperature: Double,
+        mode: ConfidenceMode,
+    ): ConfidenceExecutionResult {
+        return when (mode) {
+            ConfidenceMode.SCORING -> executeScoringRoute(requestId, history, temperature)
+            ConfidenceMode.REDUNDANCY -> executeRedundancyRoute(requestId, history, temperature)
+        }
+    }
+
+    private suspend fun executeScoringRoute(
+        requestId: Int,
+        history: List<ChatTurn>,
+        temperature: Double,
+    ): ConfidenceExecutionResult {
+        val primary = client.sendScoredChatCompletion(
+            apiKey = AppConfig.apiKey,
+            model = AppConfig.chatModel,
+            history = history,
+            temperature = temperature,
+        )
+        logScoringResponse(
+            requestId = requestId,
+            stage = "Primary",
+            model = AppConfig.chatModel,
+            response = primary,
+        )
+        if (primary.status == ConfidenceStatus.SURE) {
+            return ConfidenceExecutionResult(
+                answer = primary.answer,
+                status = primary.status,
+                auxiliaryLines = emptyList(),
+                inferenceCount = 1,
+                strongModelInferenceCount = 0,
+                inputTokens = primary.usage.inputTokens,
+                outputTokens = primary.usage.outputTokens,
+                usedStrongModel = false,
+            )
+        }
+
+        appendChatLog("Escalation #$requestId\n  Routing to stronger model: $strongChatModel")
+        val strong = client.sendScoredChatCompletion(
+            apiKey = AppConfig.apiKey,
+            model = strongChatModel,
+            history = history,
+            temperature = temperature,
+        )
+        logScoringResponse(
+            requestId = requestId,
+            stage = "Strong",
+            model = strongChatModel,
+            response = strong,
+        )
+        return ConfidenceExecutionResult(
+            answer = strong.answer,
+            status = strong.status,
+            auxiliaryLines = emptyList(),
+            inferenceCount = 2,
+            strongModelInferenceCount = 1,
+            inputTokens = primary.usage.inputTokens + strong.usage.inputTokens,
+            outputTokens = primary.usage.outputTokens + strong.usage.outputTokens,
+            usedStrongModel = true,
+        )
+    }
+
+    private suspend fun executeRedundancyRoute(
+        requestId: Int,
+        history: List<ChatTurn>,
+        temperature: Double,
+    ): ConfidenceExecutionResult {
+        val primary = client.sendRedundantChatCompletion(
+            apiKey = AppConfig.apiKey,
+            model = AppConfig.chatModel,
+            history = history,
+            temperature = temperature,
+        )
+        logRedundancyResponse(
+            requestId = requestId,
+            stage = "Primary",
+            model = AppConfig.chatModel,
+            response = primary,
+        )
+        if (primary.status == ConfidenceStatus.SURE) {
+            return ConfidenceExecutionResult(
+                answer = primary.answer,
+                status = primary.status,
+                auxiliaryLines = primary.responses,
+                inferenceCount = primary.inferenceCount,
+                strongModelInferenceCount = 0,
+                inputTokens = primary.usage.inputTokens,
+                outputTokens = primary.usage.outputTokens,
+                usedStrongModel = false,
+            )
+        }
+
+        appendChatLog("Escalation #$requestId\n  Routing to stronger model: $strongChatModel")
+        val strong = client.sendRedundantChatCompletion(
+            apiKey = AppConfig.apiKey,
+            model = strongChatModel,
+            history = history,
+            temperature = temperature,
+        )
+        logRedundancyResponse(
+            requestId = requestId,
+            stage = "Strong",
+            model = strongChatModel,
+            response = strong,
+        )
+        return ConfidenceExecutionResult(
+            answer = strong.answer,
+            status = strong.status,
+            auxiliaryLines = strong.responses,
+            inferenceCount = primary.inferenceCount + strong.inferenceCount,
+            strongModelInferenceCount = strong.inferenceCount,
+            inputTokens = primary.usage.inputTokens + strong.usage.inputTokens,
+            outputTokens = primary.usage.outputTokens + strong.usage.outputTokens,
+            usedStrongModel = true,
+        )
+    }
+
+    private fun logScoringResponse(
+        requestId: Int,
+        stage: String,
+        model: String,
+        response: com.finetune.desktop.openai.ScoredChatResponse,
+    ) {
+        appendChatLog(
+            buildString {
+                appendLine("Response #$requestId")
+                appendLine("Stage: $stage")
+                appendLine("Model: $model")
+                appendLine("Mode: Scoring")
+                appendLine("Status: ${response.status.name}")
+                appendLine("Raw answer:")
+                appendLine(formatLogBlock(response.rawAnswer))
+                appendLine("Raw API response:")
+                appendLine(formatLogBlock(response.rawResponse))
+                appendLine("Parsed answer:")
+                append(formatLogBlock(response.answer))
+            }.trimEnd()
+        )
+    }
+
+    private fun logRedundancyResponse(
+        requestId: Int,
+        stage: String,
+        model: String,
+        response: com.finetune.desktop.openai.RedundantChatResponse,
+    ) {
+        appendChatLog(
+            buildString {
+                appendLine("Response #$requestId")
+                appendLine("Stage: $stage")
+                appendLine("Model: $model")
+                appendLine("Mode: Redundancy")
+                appendLine("Status: ${response.status.name}")
+                appendLine("Responses:")
+                response.responses.forEachIndexed { index, text ->
+                    appendLine("${index + 1}.")
+                    appendLine(formatLogBlock(text))
+                }
+                appendLine("Final answer:")
+                append(formatLogBlock(response.answer))
+            }.trimEnd()
+        )
+    }
+
     private fun buildScoredLogHistory(history: List<ChatTurn>): List<ChatTurn> {
         val firstNonSystemIndex = history.indexOfFirst { it.role != "system" }
             .let { index -> if (index >= 0) index else history.size }
@@ -880,6 +1035,7 @@ private class DesktopClientState(
             successfulCount = successfulCount,
             unsuccessfulCount = unsuccessfulCount,
             inferenceCount = chatImportItems.sumOf { it.inferenceCount },
+            strongModelInferenceCount = chatImportItems.sumOf { it.strongModelInferenceCount },
             inputTokens = chatImportItems.sumOf { it.inputTokens },
             outputTokens = chatImportItems.sumOf { it.outputTokens },
             statusCounts = statusCounts,
@@ -1780,6 +1936,8 @@ private fun MessageBubble(
     val rowAlignment = if (isUser) Arrangement.End else Arrangement.Start
     val bubbleColor = if (isUser) {
         MaterialTheme.colorScheme.primary
+    } else if (message.usedStrongModel) {
+        Color(0xFFFFF3CD)
     } else {
         Color.White
     }
@@ -1793,6 +1951,11 @@ private fun MessageBubble(
     } else {
         MaterialTheme.colorScheme.secondary
     }
+    val borderColor = if (!isUser && message.usedStrongModel) {
+        Color(0xFFE0A800)
+    } else {
+        Color.Transparent
+    }
     val bubbleShape = RoundedCornerShape(
         topStart = 20.dp,
         topEnd = 20.dp,
@@ -1805,7 +1968,9 @@ private fun MessageBubble(
         horizontalArrangement = rowAlignment,
     ) {
         Card(
-            modifier = Modifier.widthIn(max = 720.dp),
+            modifier = Modifier
+                .widthIn(max = 720.dp)
+                .border(width = 2.dp, color = borderColor, shape = bubbleShape),
             colors = CardDefaults.cardColors(containerColor = bubbleColor),
             shape = bubbleShape,
         ) {
@@ -1821,6 +1986,14 @@ private fun MessageBubble(
                     fontWeight = FontWeight.Bold,
                     textAlign = if (isUser) TextAlign.End else TextAlign.Start,
                 )
+                if (message.usedStrongModel) {
+                    Text(
+                        text = "Strong model: gpt-4.1",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (isUser) contentColor.copy(alpha = 0.8f) else Color(0xFF9A6700),
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
                 if (message.auxiliaryLines.isNotEmpty()) {
                     Column(
                         verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -1925,6 +2098,7 @@ private fun ImportMetricsBlock(
             Text("Successful: ${metrics.successfulCount}")
             Text("Unsuccessful: ${metrics.unsuccessfulCount}")
             Text("Model inferences: ${metrics.inferenceCount}")
+            Text("Strong model requests: ${metrics.strongModelInferenceCount}")
             Text("Input tokens: ${metrics.inputTokens}")
             Text("Output tokens: ${metrics.outputTokens}")
             if (confidenceEnabled && metrics.statusCounts.isNotEmpty()) {
