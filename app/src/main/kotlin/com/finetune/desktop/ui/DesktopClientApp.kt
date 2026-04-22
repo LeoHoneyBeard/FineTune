@@ -1,23 +1,24 @@
 package com.finetune.desktop.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
@@ -29,6 +30,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
@@ -44,8 +46,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -66,18 +68,22 @@ import com.finetune.desktop.batch.BatchDatasetEntry
 import com.finetune.desktop.batch.BatchDatasetIO
 import com.finetune.desktop.batch.BatchResultExport
 import com.finetune.desktop.openai.ChatTurn
+import com.finetune.desktop.openai.ConfidenceStatus
 import com.finetune.desktop.openai.FineTuneJobInfo
 import com.finetune.desktop.openai.OpenAiClient
 import com.finetune.desktop.validation.DatasetValidator
-import java.io.File
-import javax.swing.JFileChooser
-import javax.swing.filechooser.FileNameExtensionFilter
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
+import javax.swing.JFileChooser
+import javax.swing.filechooser.FileNameExtensionFilter
 
 private enum class DesktopTab(val title: String) {
     CHAT("Chat"),
@@ -98,10 +104,45 @@ private enum class TranscriptRole {
     ASSISTANT,
 }
 
+private enum class ConfidenceMode(val title: String) {
+    SCORING("Scoring"),
+    REDUNDANCY("Redundancy"),
+}
+
+private enum class ChatRunMode(val title: String) {
+    MANUAL("Manual"),
+    IMPORT("Import"),
+}
+
 private data class TranscriptMessage(
     val role: TranscriptRole,
     val speaker: String,
     val content: String,
+    val confidenceStatus: ConfidenceStatus? = null,
+    val auxiliaryLines: List<String> = emptyList(),
+)
+
+private data class ChatImportItem(
+    val prompt: String,
+    val response: String? = null,
+    val confidenceStatus: ConfidenceStatus? = null,
+    val auxiliaryLines: List<String> = emptyList(),
+    val inferenceCount: Int = 0,
+    val inputTokens: Int = 0,
+    val outputTokens: Int = 0,
+    val error: String? = null,
+    val isRunning: Boolean = false,
+)
+
+private data class ChatImportMetrics(
+    val totalRequests: Int,
+    val successfulCount: Int,
+    val unsuccessfulCount: Int,
+    val inferenceCount: Int,
+    val inputTokens: Int,
+    val outputTokens: Int,
+    val statusCounts: Map<ConfidenceStatus, Int>,
+    val errorCount: Int,
 )
 
 private data class BatchPromptItem(
@@ -119,12 +160,23 @@ private data class BatchPromptItem(
 private class DesktopClientState(
     private val client: OpenAiClient = OpenAiClient(),
 ) {
+    private val json = Json { ignoreUnknownKeys = true }
     var selectedTab by mutableStateOf(DesktopTab.CHAT)
     var systemPrompt by mutableStateOf("You are a helpful assistant.")
+    var chatTemperature by mutableStateOf("1.0")
     var prompt by mutableStateOf("")
+    var chatRunMode by mutableStateOf(ChatRunMode.MANUAL)
     val chatMessages = mutableStateListOf<TranscriptMessage>()
+    val chatLogs = mutableStateListOf<String>()
     private val chatHistory = mutableListOf<ChatTurn>()
+    private var chatRequestCounter = 0
     var isChatLoading by mutableStateOf(false)
+    var isConfidenceEnabled by mutableStateOf(false)
+    var selectedConfidenceMode by mutableStateOf(ConfidenceMode.SCORING)
+    var chatImportPath by mutableStateOf("")
+    val chatImportItems = mutableStateListOf<ChatImportItem>()
+    var chatImportSummary by mutableStateOf("Select a JSON file with an array of prompt strings.")
+    var chatImportMetrics by mutableStateOf<ChatImportMetrics?>(null)
 
     var fineTuneDatasetPath by mutableStateOf("")
     val fineTuneLogs = mutableStateListOf<String>()
@@ -152,6 +204,17 @@ private class DesktopClientState(
         if (isChatLoading) return
         chatHistory.clear()
         chatMessages.clear()
+        chatLogs.clear()
+        chatImportItems.clear()
+        chatImportMetrics = null
+        chatImportSummary = "Select a JSON file with an array of prompt strings."
+    }
+
+    fun browseChatImportFile() {
+        chooseJsonFile(chatImportPath)?.let { file ->
+            chatImportPath = file.absolutePath
+            loadChatImportPrompts(file)
+        }
     }
 
     fun browseFineTuneDataset() {
@@ -178,6 +241,7 @@ private class DesktopClientState(
     fun sendChat(scope: CoroutineScope) {
         val promptText = prompt.trim()
         val systemPromptText = systemPrompt.trim()
+        val temperature = parseChatTemperatureOrShowError() ?: return
         if (promptText.isBlank()) {
             dialogMessage = "Enter a message before sending."
             return
@@ -202,17 +266,99 @@ private class DesktopClientState(
             speaker = "Model",
             content = "",
         )
+        val requestId = ++chatRequestCounter
+        val modeLabel = confidenceModeLabel(selectedConfidenceMode.takeIf { isConfidenceEnabled })
+        val requestHistory = if (selectedConfidenceMode.takeIf { isConfidenceEnabled } == ConfidenceMode.SCORING) {
+            buildScoredLogHistory(chatHistory)
+        } else {
+            chatHistory
+        }
+        appendChatLog(
+            buildString {
+                appendLine("Request #$requestId")
+                appendLine("Mode: $modeLabel")
+                appendLine("Model: ${AppConfig.chatModel}")
+                appendLine("Temperature: $temperature")
+                appendLine("Messages:")
+                requestHistory.forEachIndexed { index, turn ->
+                    appendLine("${index + 1}. ${turn.role.uppercase()}")
+                    appendLine(formatLogBlock(turn.content))
+                }
+            }.trimEnd()
+        )
 
         scope.launch {
+            val confidenceMode = selectedConfidenceMode.takeIf { isConfidenceEnabled }
             runCatching {
-                val answerBuilder = StringBuilder()
-                client.streamChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory).collect { delta ->
-                    answerBuilder.append(delta)
-                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                        content = answerBuilder.toString()
-                    )
+                when (confidenceMode) {
+                    ConfidenceMode.SCORING -> {
+                        client.sendScoredChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory, temperature)
+                            .also { response ->
+                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                    content = response.answer,
+                                    confidenceStatus = response.status,
+                                )
+                                appendChatLog(
+                                    buildString {
+                                        appendLine("Response #$requestId")
+                                        appendLine("Mode: Scoring")
+                                        appendLine("Status: ${response.status.name}")
+                                        appendLine("Raw answer:")
+                                        appendLine(formatLogBlock(response.rawAnswer))
+                                        appendLine("Raw API response:")
+                                        appendLine(formatLogBlock(response.rawResponse))
+                                        appendLine("Parsed answer:")
+                                        append(formatLogBlock(response.answer))
+                                    }.trimEnd()
+                                )
+                            }
+                            .answer
+                    }
+                    ConfidenceMode.REDUNDANCY -> {
+                        client.sendRedundantChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory, temperature)
+                            .also { response ->
+                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                    content = response.answer,
+                                    confidenceStatus = response.status,
+                                    auxiliaryLines = response.responses,
+                                )
+                                appendChatLog(
+                                    buildString {
+                                        appendLine("Response #$requestId")
+                                        appendLine("Mode: Redundancy")
+                                        appendLine("Status: ${response.status.name}")
+                                        appendLine("Responses:")
+                                        response.responses.forEachIndexed { index, item ->
+                                            appendLine("${index + 1}.")
+                                            appendLine(formatLogBlock(item))
+                                        }
+                                        appendLine("Final answer:")
+                                        append(formatLogBlock(response.answer))
+                                    }.trimEnd()
+                                )
+                            }
+                            .answer
+                    }
+                    null -> {
+                        val answerBuilder = StringBuilder()
+                        client.streamChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory, temperature).collect { delta ->
+                            answerBuilder.append(delta)
+                            chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                content = answerBuilder.toString()
+                            )
+                        }
+                        answerBuilder.toString().also { answer ->
+                            appendChatLog(
+                                buildString {
+                                    appendLine("Response #$requestId")
+                                    appendLine("Mode: Standard")
+                                    appendLine("Answer:")
+                                    append(formatLogBlock(answer))
+                                }.trimEnd()
+                            )
+                        }
+                    }
                 }
-                answerBuilder.toString()
             }.onSuccess { answer ->
                 chatHistory += ChatTurn("assistant", answer)
                 isChatLoading = false
@@ -223,8 +369,196 @@ private class DesktopClientState(
                     speaker = "Model",
                     content = "Error:\n${error.message ?: "Unknown error"}",
                 )
+                appendChatLog(
+                    buildString {
+                        appendLine("Response #$requestId")
+                        appendLine("Mode: $modeLabel")
+                        appendLine("Error:")
+                        append(formatLogBlock(error.message ?: "Unknown error"))
+                    }.trimEnd()
+                )
                 isChatLoading = false
             }
+        }
+    }
+
+    fun runImportedChat(scope: CoroutineScope) {
+        val temperature = parseChatTemperatureOrShowError() ?: return
+        if (chatImportItems.isEmpty()) {
+            dialogMessage = "Select a JSON file with prompts before running import."
+            return
+        }
+
+        isChatLoading = true
+        chatHistory.clear()
+        chatMessages.clear()
+        chatLogs.clear()
+        chatImportMetrics = null
+        chatImportSummary = "Processing ${chatImportItems.size} imported prompt(s)..."
+        for (index in chatImportItems.indices) {
+            chatImportItems[index] = chatImportItems[index].copy(
+                response = null,
+                confidenceStatus = null,
+                auxiliaryLines = emptyList(),
+                inferenceCount = 0,
+                inputTokens = 0,
+                outputTokens = 0,
+                error = null,
+                isRunning = false,
+            )
+        }
+
+        scope.launch {
+            chatImportItems.forEachIndexed { index, item ->
+                val history = buildChatPromptHistory(item.prompt)
+                val userMessageIndex = chatMessages.size
+                chatMessages += TranscriptMessage(
+                    role = TranscriptRole.USER,
+                    speaker = "You",
+                    content = item.prompt,
+                )
+                val assistantIndex = chatMessages.size
+                chatMessages += TranscriptMessage(
+                    role = TranscriptRole.ASSISTANT,
+                    speaker = "Model",
+                    content = "",
+                )
+                chatImportItems[index] = chatImportItems[index].copy(isRunning = true)
+                val requestId = ++chatRequestCounter
+                val modeLabel = confidenceModeLabel(selectedConfidenceMode.takeIf { isConfidenceEnabled })
+                val requestHistory = if (selectedConfidenceMode.takeIf { isConfidenceEnabled } == ConfidenceMode.SCORING) {
+                    buildScoredLogHistory(history)
+                } else {
+                    history
+                }
+                appendChatLog(
+                    buildString {
+                        appendLine("Request #$requestId")
+                        appendLine("Mode: $modeLabel")
+                        appendLine("Model: ${AppConfig.chatModel}")
+                        appendLine("Temperature: $temperature")
+                        appendLine("Messages:")
+                        requestHistory.forEachIndexed { historyIndex, turn ->
+                            appendLine("${historyIndex + 1}. ${turn.role.uppercase()}")
+                            appendLine(formatLogBlock(turn.content))
+                        }
+                    }.trimEnd()
+                )
+
+                runCatching {
+                    when (val confidenceMode = selectedConfidenceMode.takeIf { isConfidenceEnabled }) {
+                        ConfidenceMode.SCORING -> {
+                            client.sendScoredChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
+                                .also { response ->
+                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                        content = response.answer,
+                                        confidenceStatus = response.status,
+                                    )
+                                    chatImportItems[index] = chatImportItems[index].copy(
+                                        response = response.answer,
+                                        confidenceStatus = response.status,
+                                        inferenceCount = 1,
+                                        inputTokens = response.usage.inputTokens,
+                                        outputTokens = response.usage.outputTokens,
+                                        isRunning = false,
+                                    )
+                                    appendChatLog(
+                                        buildString {
+                                            appendLine("Response #$requestId")
+                                            appendLine("Mode: ${confidenceMode.title}")
+                                            appendLine("Status: ${response.status.name}")
+                                            appendLine("Raw answer:")
+                                            appendLine(formatLogBlock(response.rawAnswer))
+                                            appendLine("Raw API response:")
+                                            appendLine(formatLogBlock(response.rawResponse))
+                                            appendLine("Parsed answer:")
+                                            append(formatLogBlock(response.answer))
+                                        }.trimEnd()
+                                    )
+                                }
+                        }
+                        ConfidenceMode.REDUNDANCY -> {
+                            client.sendRedundantChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
+                                .also { response ->
+                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                        content = response.answer,
+                                        confidenceStatus = response.status,
+                                        auxiliaryLines = response.responses,
+                                    )
+                                    chatImportItems[index] = chatImportItems[index].copy(
+                                        response = response.answer,
+                                        confidenceStatus = response.status,
+                                        auxiliaryLines = response.responses,
+                                        inferenceCount = response.inferenceCount,
+                                        inputTokens = response.usage.inputTokens,
+                                        outputTokens = response.usage.outputTokens,
+                                        isRunning = false,
+                                    )
+                                    appendChatLog(
+                                        buildString {
+                                            appendLine("Response #$requestId")
+                                            appendLine("Mode: ${confidenceMode.title}")
+                                            appendLine("Status: ${response.status.name}")
+                                            appendLine("Responses:")
+                                            response.responses.forEachIndexed { responseIndex, text ->
+                                                appendLine("${responseIndex + 1}.")
+                                                appendLine(formatLogBlock(text))
+                                            }
+                                            appendLine("Final answer:")
+                                            append(formatLogBlock(response.answer))
+                                        }.trimEnd()
+                                    )
+                                }
+                        }
+                        null -> {
+                            client.sendChatCompletionDetailed(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
+                                .also { response ->
+                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                        content = response.answer.ifBlank { "-" },
+                                    )
+                                    chatImportItems[index] = chatImportItems[index].copy(
+                                        response = response.answer.ifBlank { "-" },
+                                        inferenceCount = 1,
+                                        inputTokens = response.usage.inputTokens,
+                                        outputTokens = response.usage.outputTokens,
+                                        isRunning = false,
+                                    )
+                                    appendChatLog(
+                                        buildString {
+                                            appendLine("Response #$requestId")
+                                            appendLine("Mode: Standard")
+                                            appendLine("Answer:")
+                                            append(formatLogBlock(response.answer))
+                                        }.trimEnd()
+                                    )
+                                }
+                        }
+                    }
+                }.onFailure { error ->
+                    chatMessages[assistantIndex] = TranscriptMessage(
+                        role = TranscriptRole.ASSISTANT,
+                        speaker = "Model",
+                        content = "Error:\n${error.message ?: "Unknown error"}",
+                    )
+                    chatImportItems[index] = chatImportItems[index].copy(
+                        response = null,
+                        error = error.message ?: "Unknown error",
+                        isRunning = false,
+                    )
+                    appendChatLog(
+                        buildString {
+                            appendLine("Response #$requestId")
+                            appendLine("Mode: $modeLabel")
+                            appendLine("Error:")
+                            append(formatLogBlock(error.message ?: "Unknown error"))
+                        }.trimEnd()
+                    )
+                }
+            }
+
+            chatImportMetrics = buildChatImportMetrics()
+            chatImportSummary = "Completed ${chatImportItems.size} imported prompt(s)."
+            isChatLoading = false
         }
     }
 
@@ -259,7 +593,7 @@ private class DesktopClientState(
                 }
 
                 runCatching {
-                    client.sendChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history)
+                    client.sendChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history, 1.0)
                 }.onSuccess { response ->
                     batchItems[index] = batchItems[index].copy(
                         response = response,
@@ -436,6 +770,119 @@ private class DesktopClientState(
         fineTuneLogs += message
     }
 
+    private fun appendChatLog(entry: String) {
+        chatLogs += entry
+        chatLogs += ""
+    }
+
+    private fun confidenceModeLabel(mode: ConfidenceMode?): String {
+        return mode?.title ?: "Standard"
+    }
+
+    private fun formatLogBlock(text: String): String {
+        return text.ifBlank { "-" }
+            .lines()
+            .joinToString(separator = "\n") { "  $it" }
+    }
+
+    private fun parseChatTemperatureOrShowError(): Double? {
+        val temperature = chatTemperature.trim().toDoubleOrNull()
+        if (temperature == null || temperature !in 0.0..2.0) {
+            dialogMessage = "Temperature must be a number between 0.0 and 2.0."
+            return null
+        }
+        return temperature
+    }
+
+    private fun buildChatPromptHistory(promptText: String): List<ChatTurn> {
+        val systemPromptText = systemPrompt.trim()
+        return buildList {
+            if (systemPromptText.isNotBlank()) {
+                add(ChatTurn("system", systemPromptText))
+            }
+            add(ChatTurn("user", promptText))
+        }
+    }
+
+    private fun buildScoredLogHistory(history: List<ChatTurn>): List<ChatTurn> {
+        val firstNonSystemIndex = history.indexOfFirst { it.role != "system" }
+            .let { index -> if (index >= 0) index else history.size }
+        return buildList(history.size + 1) {
+            addAll(history.take(firstNonSystemIndex))
+            add(
+                ChatTurn(
+                    role = "system",
+                    content = """
+                        You must evaluate your confidence in the final answer.
+                        Return only valid JSON with exactly two string fields:
+                        {"status":"SURE|UNSURE|FAIL","answer":"<final answer>"}
+                        Use:
+                        - SURE when the answer is reliable and directly supported.
+                        - UNSURE when the answer may be incomplete, ambiguous, or needs verification.
+                        - FAIL when you cannot answer the request correctly.
+                        Do not include markdown fences or any text outside the JSON object.
+                    """.trimIndent()
+                )
+            )
+            addAll(history.drop(firstNonSystemIndex))
+        }
+    }
+
+    private fun loadChatImportPrompts(file: File) {
+        runCatching {
+            val root = json.parseToJsonElement(file.readText())
+            root.jsonArray.mapIndexed { index, element ->
+                val prompt = element.jsonPrimitive.contentOrNull?.trim()
+                    ?: throw IllegalArgumentException("Item ${index + 1} must be a string.")
+                if (prompt.isBlank()) {
+                    throw IllegalArgumentException("Item ${index + 1} must not be blank.")
+                }
+                ChatImportItem(prompt = prompt)
+            }
+        }.onSuccess { prompts ->
+            chatImportItems.clear()
+            chatImportItems.addAll(prompts)
+            chatImportMetrics = null
+            chatImportSummary = if (prompts.isEmpty()) {
+                "JSON file does not contain any prompts."
+            } else {
+                "Loaded ${prompts.size} prompt(s) from ${file.name}."
+            }
+        }.onFailure { error ->
+            chatImportItems.clear()
+            chatImportMetrics = null
+            chatImportSummary = "Failed to load import prompts."
+            dialogMessage = error.message ?: "Failed to parse import prompts."
+        }
+    }
+
+    private fun buildChatImportMetrics(): ChatImportMetrics {
+        val statusCounts = chatImportItems.mapNotNull { it.confidenceStatus }
+            .groupingBy { it }
+            .eachCount()
+        val errorCount = chatImportItems.count { it.error != null }
+        val successfulCount = if (isConfidenceEnabled) {
+            statusCounts[ConfidenceStatus.SURE] ?: 0
+        } else {
+            chatImportItems.count { it.error == null && it.response != null }
+        }
+        val unsuccessfulCount = if (isConfidenceEnabled) {
+            chatImportItems.size - successfulCount
+        } else {
+            errorCount
+        }
+        return ChatImportMetrics(
+            totalRequests = chatImportItems.size,
+            successfulCount = successfulCount,
+            unsuccessfulCount = unsuccessfulCount,
+            inferenceCount = chatImportItems.sumOf { it.inferenceCount },
+            inputTokens = chatImportItems.sumOf { it.inputTokens },
+            outputTokens = chatImportItems.sumOf { it.outputTokens },
+            statusCounts = statusCounts,
+            errorCount = errorCount,
+        )
+    }
+
     private fun loadBatchDataset(file: File) {
         runCatching {
             BatchDatasetIO.parse(file)
@@ -463,6 +910,24 @@ private class DesktopClientState(
     private fun chooseJsonlFile(currentPath: String): File? {
         val chooser = JFileChooser().apply {
             fileFilter = FileNameExtensionFilter("JSONL dataset", "jsonl")
+            val currentFile = currentPath.takeIf { it.isNotBlank() }?.let(::File)
+            currentDirectory = when {
+                currentFile == null -> currentDirectory
+                currentFile.isDirectory -> currentFile
+                currentFile.parentFile?.exists() == true -> currentFile.parentFile
+                else -> currentDirectory
+            }
+        }
+        return if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
+            chooser.selectedFile
+        } else {
+            null
+        }
+    }
+
+    private fun chooseJsonFile(currentPath: String): File? {
+        val chooser = JFileChooser().apply {
+            fileFilter = FileNameExtensionFilter("JSON file", "json")
             val currentFile = currentPath.takeIf { it.isNotBlank() }?.let(::File)
             currentDirectory = when {
                 currentFile == null -> currentDirectory
@@ -612,6 +1077,80 @@ private fun ChatScreen(
                 enabled = !state.isChatLoading,
                 label = { Text("System Prompt") },
             )
+            OutlinedTextField(
+                value = state.chatTemperature,
+                onValueChange = { state.chatTemperature = it },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !state.isChatLoading,
+                label = { Text("Temperature") },
+                singleLine = true,
+                supportingText = {
+                    Text("Range: 0.0 to 2.0")
+                },
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(
+                    checked = state.isConfidenceEnabled,
+                    onCheckedChange = { state.isConfidenceEnabled = it },
+                    enabled = !state.isChatLoading,
+                )
+                Text("Оценка уверенности")
+            }
+            if (state.isConfidenceEnabled) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    ConfidenceMode.entries.forEach { mode ->
+                        Row(
+                            modifier = Modifier.selectable(
+                                selected = state.selectedConfidenceMode == mode,
+                                enabled = !state.isChatLoading,
+                                onClick = { state.selectedConfidenceMode = mode },
+                            ),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(
+                                selected = state.selectedConfidenceMode == mode,
+                                onClick = { state.selectedConfidenceMode = mode },
+                                enabled = !state.isChatLoading,
+                            )
+                            Text(mode.title)
+                        }
+                    }
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ChatRunMode.entries.forEach { mode ->
+                Row(
+                    modifier = Modifier.selectable(
+                        selected = state.chatRunMode == mode,
+                        enabled = !state.isChatLoading,
+                        onClick = { state.chatRunMode = mode },
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(
+                        selected = state.chatRunMode == mode,
+                        onClick = { state.chatRunMode = mode },
+                        enabled = !state.isChatLoading,
+                    )
+                    Text(mode.title)
+                }
+            }
         }
 
         SectionCard(
@@ -648,64 +1187,121 @@ private fun ChatScreen(
             }
         }
 
-        SectionCard(
-            title = "Prompt",
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (state.isChatLoading) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                            Text("Waiting for model response...")
+        if (state.chatRunMode == ChatRunMode.MANUAL) {
+            SectionCard(
+                title = "Prompt",
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (state.isChatLoading) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Text("Waiting for model response...")
+                            }
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         }
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+
+                    OutlinedTextField(
+                        value = state.prompt,
+                        onValueChange = { state.prompt = it },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(160.dp)
+                            .chatInputKeyHandler(
+                                canSend = !state.isChatLoading,
+                                onSend = { state.sendChat(scope) },
+                                onInsertNewLine = {
+                                    state.prompt = buildString(state.prompt.length + 1) {
+                                        append(state.prompt)
+                                        append('\n')
+                                    }
+                                },
+                            ),
+                        enabled = !state.isChatLoading,
+                        label = { Text("Message") },
+                    )
+                    Text(
+                        text = "Enter to send, Ctrl+Enter for a new line",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        TextButton(
+                            onClick = state::clearChat,
+                            enabled = !state.isChatLoading,
+                        ) {
+                            Text("Clear chat")
+                        }
+                        Spacer(modifier = Modifier.size(8.dp))
+                        Button(
+                            onClick = { state.sendChat(scope) },
+                            enabled = !state.isChatLoading,
+                        ) {
+                            Text("Send")
+                        }
                     }
                 }
-
-                OutlinedTextField(
-                    value = state.prompt,
-                    onValueChange = { state.prompt = it },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(160.dp)
-                        .chatInputKeyHandler(
-                            canSend = !state.isChatLoading,
-                            onSend = { state.sendChat(scope) },
-                            onInsertNewLine = {
-                                state.prompt = buildString(state.prompt.length + 1) {
-                                    append(state.prompt)
-                                    append('\n')
-                                }
-                            },
-                        ),
-                    enabled = !state.isChatLoading,
-                    label = { Text("Message") },
-                )
-                Text(
-                    text = "Enter to send, Ctrl+Enter for a new line",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    TextButton(
-                        onClick = state::clearChat,
-                        enabled = !state.isChatLoading,
-                    ) {
-                        Text("Clear chat")
+            }
+        } else {
+            SectionCard(
+                title = "Import",
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (state.isChatLoading) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                Text("Running imported prompts...")
+                            }
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
                     }
-                    Spacer(modifier = Modifier.size(8.dp))
-                    Button(
-                        onClick = { state.sendChat(scope) },
+                    FilePickerField(
+                        label = "Prompts JSON",
+                        path = state.chatImportPath,
+                        onBrowse = state::browseChatImportFile,
                         enabled = !state.isChatLoading,
+                        buttonLabel = "Select JSON",
+                    )
+                    Text(
+                        text = state.chatImportSummary,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    state.chatImportMetrics?.let { metrics ->
+                        ImportMetricsBlock(
+                            metrics = metrics,
+                            confidenceEnabled = state.isConfidenceEnabled,
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
                     ) {
-                        Text("Send")
+                        TextButton(
+                            onClick = state::clearChat,
+                            enabled = !state.isChatLoading,
+                        ) {
+                            Text("Clear chat")
+                        }
+                        Spacer(modifier = Modifier.size(8.dp))
+                        Button(
+                            onClick = { state.runImportedChat(scope) },
+                            enabled = state.chatImportItems.isNotEmpty() && !state.isChatLoading,
+                        ) {
+                            Text("Run import")
+                        }
                     }
                 }
             }
@@ -1116,11 +1712,38 @@ private fun MessageBubble(
                     fontWeight = FontWeight.Bold,
                     textAlign = if (isUser) TextAlign.End else TextAlign.Start,
                 )
+                if (message.auxiliaryLines.isNotEmpty()) {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start,
+                    ) {
+                        message.auxiliaryLines.forEachIndexed { index, line ->
+                            Text(
+                                text = "${index + 1}. $line",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = contentColor.copy(alpha = 0.72f),
+                                textAlign = if (isUser) TextAlign.End else TextAlign.Start,
+                            )
+                        }
+                    }
+                }
                 SelectionContainer {
                     Text(
                         text = message.content.ifBlank { "..." },
                         style = MaterialTheme.typography.bodyLarge,
                         color = contentColor,
+                    )
+                }
+                message.confidenceStatus?.let { status ->
+                    Text(
+                        text = "Status: ${status.name}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (isUser) {
+                            MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.82f)
+                        } else {
+                            confidenceStatusColor(status)
+                        },
+                        fontWeight = FontWeight.SemiBold,
                     )
                 }
             }
@@ -1134,6 +1757,7 @@ private fun FilePickerField(
     path: String,
     onBrowse: () -> Unit,
     enabled: Boolean,
+    buttonLabel: String = "Select JSONL",
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1163,7 +1787,46 @@ private fun FilePickerField(
             onClick = onBrowse,
             enabled = enabled,
         ) {
-            Text("Select JSONL")
+            Text(buttonLabel)
+        }
+    }
+}
+
+@Composable
+private fun ImportMetricsBlock(
+    metrics: ChatImportMetrics,
+    confidenceEnabled: Boolean,
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = "Metrics",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text("Total requests: ${metrics.totalRequests}")
+            Text("Successful: ${metrics.successfulCount}")
+            Text("Unsuccessful: ${metrics.unsuccessfulCount}")
+            Text("Model inferences: ${metrics.inferenceCount}")
+            Text("Input tokens: ${metrics.inputTokens}")
+            Text("Output tokens: ${metrics.outputTokens}")
+            if (confidenceEnabled && metrics.statusCounts.isNotEmpty()) {
+                ConfidenceStatus.entries.forEach { status ->
+                    val count = metrics.statusCounts[status] ?: 0
+                    Text("${status.name}: $count")
+                }
+            }
+            if (metrics.errorCount > 0) {
+                Text("Errors: ${metrics.errorCount}")
+            }
         }
     }
 }
@@ -1220,6 +1883,15 @@ private fun validationSummaryColor(indicator: ValidationIndicator): Color {
         ValidationIndicator.ERROR -> Color(0xFFC62828)
         ValidationIndicator.LOADING -> Color(0xFF8A6D1D)
         ValidationIndicator.IDLE -> MaterialTheme.colorScheme.onSurface
+    }
+}
+
+@Composable
+private fun confidenceStatusColor(status: ConfidenceStatus): Color {
+    return when (status) {
+        ConfidenceStatus.SURE -> Color(0xFF1F8A3B)
+        ConfidenceStatus.UNSURE -> Color(0xFF8A6D1D)
+        ConfidenceStatus.FAIL -> Color(0xFFC62828)
     }
 }
 
