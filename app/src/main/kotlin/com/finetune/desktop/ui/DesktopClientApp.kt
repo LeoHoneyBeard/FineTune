@@ -3,8 +3,10 @@ package com.finetune.desktop.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -53,12 +55,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -1052,6 +1056,7 @@ private fun ChatScreen(
     scope: CoroutineScope,
 ) {
     val transcriptState = rememberLazyListState()
+    var conversationFraction by remember { mutableStateOf(0.62f) }
 
     androidx.compose.runtime.LaunchedEffect(
         state.chatMessages.size,
@@ -1153,158 +1158,262 @@ private fun ChatScreen(
             }
         }
 
-        SectionCard(
-            title = "Conversation",
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
         ) {
-            if (state.chatMessages.isEmpty()) {
+            val density = LocalDensity.current
+            val dividerHeight = 14.dp
+            val minPaneHeight = 180.dp
+            val totalHeightPx = with(density) { maxHeight.toPx() }
+            val dividerHeightPx = with(density) { dividerHeight.toPx() }
+            val minPaneHeightPx = with(density) { minPaneHeight.toPx() }
+            val availablePaneHeightPx = (totalHeightPx - dividerHeightPx).coerceAtLeast(minPaneHeightPx * 2)
+            val clampedConversationFraction = conversationFraction.coerceIn(
+                minimumValue = minPaneHeightPx / availablePaneHeightPx,
+                maximumValue = 1f - (minPaneHeightPx / availablePaneHeightPx),
+            )
+            if (clampedConversationFraction != conversationFraction) {
+                conversationFraction = clampedConversationFraction
+            }
+            val conversationHeight = with(density) { (availablePaneHeightPx * conversationFraction).toDp() }
+            val bottomHeight = with(density) { (availablePaneHeightPx * (1f - conversationFraction)).toDp() }
+
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
+            ) {
+                SectionCard(
+                    title = "Conversation",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(conversationHeight),
+                ) {
+                    if (state.chatMessages.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(12.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "Conversation is empty.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    } else {
+                        LazyColumn(
+                            state = transcriptState,
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            itemsIndexed(state.chatMessages) { _, message ->
+                                MessageBubble(
+                                    message = message,
+                                    modifier = Modifier,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                ChatPaneResizer(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(dividerHeight)
+                        .pointerInput(totalHeightPx) {
+                            detectVerticalDragGestures { _, dragAmount ->
+                                val deltaFraction = dragAmount / availablePaneHeightPx
+                                conversationFraction = (conversationFraction + deltaFraction).coerceIn(
+                                    minimumValue = minPaneHeightPx / availablePaneHeightPx,
+                                    maximumValue = 1f - (minPaneHeightPx / availablePaneHeightPx),
+                                )
+                            }
+                        },
+                )
+
                 Box(
                     modifier = Modifier
-                        .fillMaxSize()
-                        .padding(12.dp),
-                    contentAlignment = Alignment.Center,
+                        .fillMaxWidth()
+                        .height(bottomHeight),
                 ) {
-                    Text(
-                        text = "Conversation is empty.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            } else {
-                LazyColumn(
-                    state = transcriptState,
-                    modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    itemsIndexed(state.chatMessages) { _, message ->
-                        MessageBubble(
-                            message = message,
-                            modifier = Modifier,
-                        )
+                    if (state.chatRunMode == ChatRunMode.MANUAL) {
+                        ManualChatPane(state = state, scope = scope)
+                    } else {
+                        ImportChatPane(state = state, scope = scope)
                     }
                 }
             }
         }
+    }
+}
 
-        if (state.chatRunMode == ChatRunMode.MANUAL) {
-            SectionCard(
-                title = "Prompt",
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    if (state.isChatLoading) {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                                Text("Waiting for model response...")
-                            }
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        }
-                    }
-
-                    OutlinedTextField(
-                        value = state.prompt,
-                        onValueChange = { state.prompt = it },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(160.dp)
-                            .chatInputKeyHandler(
-                                canSend = !state.isChatLoading,
-                                onSend = { state.sendChat(scope) },
-                                onInsertNewLine = {
-                                    state.prompt = buildString(state.prompt.length + 1) {
-                                        append(state.prompt)
-                                        append('\n')
-                                    }
-                                },
-                            ),
-                        enabled = !state.isChatLoading,
-                        label = { Text("Message") },
-                    )
-                    Text(
-                        text = "Enter to send, Ctrl+Enter for a new line",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+@Composable
+private fun ManualChatPane(
+    state: DesktopClientState,
+    scope: CoroutineScope,
+) {
+    SectionCard(
+        title = "Prompt",
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (state.isChatLoading) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        TextButton(
-                            onClick = state::clearChat,
-                            enabled = !state.isChatLoading,
-                        ) {
-                            Text("Clear chat")
-                        }
-                        Spacer(modifier = Modifier.size(8.dp))
-                        Button(
-                            onClick = { state.sendChat(scope) },
-                            enabled = !state.isChatLoading,
-                        ) {
-                            Text("Send")
-                        }
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text("Waiting for model response...")
                     }
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                 }
             }
-        } else {
-            SectionCard(
-                title = "Import",
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    if (state.isChatLoading) {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                                Text("Running imported prompts...")
+
+            OutlinedTextField(
+                value = state.prompt,
+                onValueChange = { state.prompt = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(160.dp)
+                    .chatInputKeyHandler(
+                        canSend = !state.isChatLoading,
+                        onSend = { state.sendChat(scope) },
+                        onInsertNewLine = {
+                            state.prompt = buildString(state.prompt.length + 1) {
+                                append(state.prompt)
+                                append('\n')
                             }
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        }
-                    }
-                    FilePickerField(
-                        label = "Prompts JSON",
-                        path = state.chatImportPath,
-                        onBrowse = state::browseChatImportFile,
-                        enabled = !state.isChatLoading,
-                        buttonLabel = "Select JSON",
-                    )
-                    Text(
-                        text = state.chatImportSummary,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    state.chatImportMetrics?.let { metrics ->
-                        ImportMetricsBlock(
-                            metrics = metrics,
-                            confidenceEnabled = state.isConfidenceEnabled,
-                        )
-                    }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End,
-                    ) {
-                        TextButton(
-                            onClick = state::clearChat,
-                            enabled = !state.isChatLoading,
-                        ) {
-                            Text("Clear chat")
-                        }
-                        Spacer(modifier = Modifier.size(8.dp))
-                        Button(
-                            onClick = { state.runImportedChat(scope) },
-                            enabled = state.chatImportItems.isNotEmpty() && !state.isChatLoading,
-                        ) {
-                            Text("Run import")
-                        }
-                    }
+                        },
+                    ),
+                enabled = !state.isChatLoading,
+                label = { Text("Message") },
+            )
+            Text(
+                text = "Enter to send, Ctrl+Enter for a new line",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextButton(
+                    onClick = state::clearChat,
+                    enabled = !state.isChatLoading,
+                ) {
+                    Text("Clear chat")
+                }
+                Spacer(modifier = Modifier.size(8.dp))
+                Button(
+                    onClick = { state.sendChat(scope) },
+                    enabled = !state.isChatLoading,
+                ) {
+                    Text("Send")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ImportChatPane(
+    state: DesktopClientState,
+    scope: CoroutineScope,
+) {
+    SectionCard(
+        title = "Import",
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (state.isChatLoading) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text("Running imported prompts...")
+                    }
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+            }
+            FilePickerField(
+                label = "Prompts JSON",
+                path = state.chatImportPath,
+                onBrowse = state::browseChatImportFile,
+                enabled = !state.isChatLoading,
+                buttonLabel = "Select JSON",
+            )
+            Text(
+                text = state.chatImportSummary,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            state.chatImportMetrics?.let { metrics ->
+                ImportMetricsBlock(
+                    metrics = metrics,
+                    confidenceEnabled = state.isConfidenceEnabled,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextButton(
+                    onClick = state::clearChat,
+                    enabled = !state.isChatLoading,
+                ) {
+                    Text("Clear chat")
+                }
+                Spacer(modifier = Modifier.size(8.dp))
+                Button(
+                    onClick = { state.runImportedChat(scope) },
+                    enabled = state.chatImportItems.isNotEmpty() && !state.isChatLoading,
+                ) {
+                    Text("Run import")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChatPaneResizer(
+    modifier: Modifier = Modifier,
+) {
+    val outlineColor = MaterialTheme.colorScheme.outlineVariant
+    val surfaceVariantColor = MaterialTheme.colorScheme.surfaceVariant
+    val onSurfaceVariantColor = MaterialTheme.colorScheme.onSurfaceVariant
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(12.dp),
+        ) {
+            val y = size.height / 2f
+            drawLine(
+                color = outlineColor,
+                start = Offset(0f, y),
+                end = Offset(size.width, y),
+                strokeWidth = 2.dp.toPx(),
+                cap = StrokeCap.Round,
+            )
+        }
+        Card(
+            colors = CardDefaults.cardColors(containerColor = surfaceVariantColor),
+            shape = RoundedCornerShape(999.dp),
+        ) {
+            Text(
+                text = "Drag to resize",
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = onSurfaceVariantColor,
+            )
         }
     }
 }
