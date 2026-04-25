@@ -36,6 +36,10 @@ fun Properties.requiredLocalProperty(key: String): String {
     }
 }
 
+fun Properties.optionalLocalProperty(key: String, defaultValue: String): String {
+    return getProperty(key)?.trim().orEmpty().ifBlank { defaultValue }
+}
+
 val generateLocalConfig by tasks.registering {
     val outputDir = generatedConfigDir
     outputs.dir(outputDir)
@@ -44,6 +48,12 @@ val generateLocalConfig by tasks.registering {
         val file = outputDir.get().file("com/finetune/desktop/AppConfig.kt").asFile
         file.parentFile.mkdirs()
         val localProperties = project.loadLocalProperties()
+        val ollamaBaseUrl = localProperties
+            .optionalLocalProperty("ollama.base_url", "http://localhost:11434")
+            .removeSuffix("/")
+        val ollamaOpenAiBaseUrl = localProperties
+            .optionalLocalProperty("ollama.openai.base_url", "$ollamaBaseUrl/v1")
+            .removeSuffix("/")
 
         fun escape(value: String): String = buildString(value.length + 16) {
             value.forEach { char ->
@@ -66,6 +76,9 @@ val generateLocalConfig by tasks.registering {
                 const val apiKey: String = "${escape(localProperties.requiredLocalProperty("openai.api.token"))}"
                 const val chatModel: String = "${escape(localProperties.requiredLocalProperty("openai.chat.model"))}"
                 const val fineTuneModel: String = "${escape(localProperties.requiredLocalProperty("openai.fine_tune.model"))}"
+                const val strongChatModel: String = "${escape(localProperties.optionalLocalProperty("openai.confidence.strong.model", "gpt-4.1"))}"
+                const val ollamaBaseUrl: String = "${escape(ollamaBaseUrl)}"
+                const val ollamaOpenAiBaseUrl: String = "${escape(ollamaOpenAiBaseUrl)}"
             }
             """.trimIndent()
         )

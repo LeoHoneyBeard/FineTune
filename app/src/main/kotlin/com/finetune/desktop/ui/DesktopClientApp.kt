@@ -4,6 +4,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -23,14 +24,18 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -74,7 +79,10 @@ import com.finetune.desktop.batch.BatchResultExport
 import com.finetune.desktop.openai.ChatTurn
 import com.finetune.desktop.openai.ConfidenceStatus
 import com.finetune.desktop.openai.FineTuneJobInfo
+import com.finetune.desktop.openai.ModelOption
+import com.finetune.desktop.openai.ModelProvider
 import com.finetune.desktop.openai.OpenAiClient
+import com.finetune.desktop.openai.OllamaClient
 import com.finetune.desktop.validation.DatasetValidator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -125,6 +133,7 @@ private data class TranscriptMessage(
     val confidenceStatus: ConfidenceStatus? = null,
     val auxiliaryLines: List<String> = emptyList(),
     val usedStrongModel: Boolean = false,
+    val strongModelLabel: String? = null,
 )
 
 private data class ChatImportItem(
@@ -139,6 +148,7 @@ private data class ChatImportItem(
     val error: String? = null,
     val isRunning: Boolean = false,
     val usedStrongModel: Boolean = false,
+    val strongModelLabel: String? = null,
 )
 
 private data class ChatImportMetrics(
@@ -162,6 +172,13 @@ private data class ConfidenceExecutionResult(
     val inputTokens: Int,
     val outputTokens: Int,
     val usedStrongModel: Boolean,
+    val strongModelLabel: String?,
+)
+
+private data class ModelExecutionTarget(
+    val option: ModelOption,
+    val client: OpenAiClient,
+    val apiKey: String?,
 )
 
 private data class BatchPromptItem(
@@ -179,13 +196,29 @@ private data class BatchPromptItem(
 private class DesktopClientState(
     private val client: OpenAiClient = OpenAiClient(),
 ) {
-    private val strongChatModel = "gpt-4.1"
+    private val ollamaClient = OllamaClient(AppConfig.ollamaBaseUrl)
+    private val ollamaChatClient = OpenAiClient(AppConfig.ollamaOpenAiBaseUrl)
     private val json = Json { ignoreUnknownKeys = true }
+    private val projectModelOptions = listOf(
+        ModelOption(name = AppConfig.chatModel, provider = ModelProvider.OPENAI),
+        ModelOption(name = AppConfig.strongChatModel, provider = ModelProvider.OPENAI),
+        ModelOption(name = AppConfig.fineTuneModel, provider = ModelProvider.OPENAI),
+    ).distinctBy(ModelOption::key)
+    val availableModelOptions = mutableStateListOf<ModelOption>().apply {
+        addAll(projectModelOptions)
+    }
     var selectedTab by mutableStateOf(DesktopTab.CHAT)
     var systemPrompt by mutableStateOf("You are a helpful assistant.")
     var chatTemperature by mutableStateOf("1.0")
     var prompt by mutableStateOf("")
     var chatRunMode by mutableStateOf(ChatRunMode.MANUAL)
+    var selectedChatModelKey by mutableStateOf(projectModelOptions.first().key)
+    var selectedWeakModelKey by mutableStateOf(projectModelOptions.first().key)
+    var selectedStrongModelKey by mutableStateOf(
+        projectModelOptions.firstOrNull { it.name == AppConfig.strongChatModel }?.key ?: projectModelOptions.first().key
+    )
+    var isRefreshingModels by mutableStateOf(false)
+    var modelCatalogStatus by mutableStateOf("Project models loaded. You can also fetch models from Ollama.")
     val chatMessages = mutableStateListOf<TranscriptMessage>()
     val chatLogs = mutableStateListOf<String>()
     private val chatHistory = mutableListOf<ChatTurn>()
@@ -193,6 +226,7 @@ private class DesktopClientState(
     var isChatLoading by mutableStateOf(false)
     var isConfidenceEnabled by mutableStateOf(false)
     var selectedConfidenceMode by mutableStateOf(ConfidenceMode.SCORING)
+    val scoringEnumOptions = mutableStateListOf<String>()
     var chatImportPath by mutableStateOf("")
     val chatImportItems = mutableStateListOf<ChatImportItem>()
     var chatImportSummary by mutableStateOf("Select a JSON file with an array of prompt strings.")
@@ -220,6 +254,48 @@ private class DesktopClientState(
         pollingJob?.cancel()
     }
 
+    fun selectedChatModel(): ModelOption = resolveModelOption(selectedChatModelKey)
+
+    fun selectedWeakModel(): ModelOption = resolveModelOption(selectedWeakModelKey)
+
+    fun selectedStrongModel(): ModelOption = resolveModelOption(selectedStrongModelKey)
+
+    fun addScoringEnumOption() {
+        scoringEnumOptions += ""
+    }
+
+    fun updateScoringEnumOption(index: Int, value: String) {
+        if (index in scoringEnumOptions.indices) {
+            scoringEnumOptions[index] = value
+        }
+    }
+
+    fun refreshOllamaModels(scope: CoroutineScope) {
+        if (isRefreshingModels) return
+        isRefreshingModels = true
+        modelCatalogStatus = "Loading models from Ollama..."
+        scope.launch {
+            runCatching { ollamaClient.fetchAvailableModels() }
+                .onSuccess { ollamaModels ->
+                    val merged = (projectModelOptions + ollamaModels)
+                        .distinctBy(ModelOption::key)
+                        .sortedWith(compareBy<ModelOption>({ it.provider.ordinal }, { it.name.lowercase() }))
+                    availableModelOptions.clear()
+                    availableModelOptions.addAll(merged)
+                    modelCatalogStatus = if (ollamaModels.isEmpty()) {
+                        "No Ollama models found. Project models remain available."
+                    } else {
+                        "Loaded ${ollamaModels.size} model(s) from Ollama."
+                    }
+                }
+                .onFailure { error ->
+                    modelCatalogStatus = "Could not load Ollama models."
+                    dialogMessage = error.message ?: "Could not load Ollama models."
+                }
+            isRefreshingModels = false
+        }
+    }
+
     fun clearChat() {
         if (isChatLoading) return
         chatHistory.clear()
@@ -228,6 +304,34 @@ private class DesktopClientState(
         chatImportItems.clear()
         chatImportMetrics = null
         chatImportSummary = "Select a JSON file with an array of prompt strings."
+    }
+
+    private fun resolveModelOption(key: String): ModelOption {
+        return availableModelOptions.firstOrNull { it.key == key }
+            ?: projectModelOptions.first()
+    }
+
+    private fun createExecutionTarget(option: ModelOption): ModelExecutionTarget {
+        return when (option.provider) {
+            ModelProvider.OPENAI -> ModelExecutionTarget(
+                option = option,
+                client = client,
+                apiKey = AppConfig.apiKey,
+            )
+
+            ModelProvider.OLLAMA -> ModelExecutionTarget(
+                option = option,
+                client = ollamaChatClient,
+                apiKey = null,
+            )
+        }
+    }
+
+    private fun activeScoringEnumOptions(): Set<String> {
+        return scoringEnumOptions
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .toSet()
     }
 
     fun browseChatImportFile() {
@@ -288,6 +392,7 @@ private class DesktopClientState(
         )
         val requestId = ++chatRequestCounter
         val modeLabel = confidenceModeLabel(selectedConfidenceMode.takeIf { isConfidenceEnabled })
+        val requestModel = if (isConfidenceEnabled) selectedWeakModel() else selectedChatModel()
         val requestHistory = if (selectedConfidenceMode.takeIf { isConfidenceEnabled } == ConfidenceMode.SCORING) {
             buildScoredLogHistory(chatHistory)
         } else {
@@ -297,7 +402,7 @@ private class DesktopClientState(
             buildString {
                 appendLine("Request #$requestId")
                 appendLine("Mode: $modeLabel")
-                appendLine("Model: ${AppConfig.chatModel}")
+                appendLine("Model: ${requestModel.label}")
                 appendLine("Temperature: $temperature")
                 appendLine("Messages:")
                 requestHistory.forEachIndexed { index, turn ->
@@ -322,6 +427,7 @@ private class DesktopClientState(
                                 content = response.answer,
                                 confidenceStatus = response.status,
                                 usedStrongModel = response.usedStrongModel,
+                                strongModelLabel = response.strongModelLabel,
                             )
                         }.answer
                     }
@@ -337,12 +443,14 @@ private class DesktopClientState(
                                 confidenceStatus = response.status,
                                 auxiliaryLines = response.auxiliaryLines,
                                 usedStrongModel = response.usedStrongModel,
+                                strongModelLabel = response.strongModelLabel,
                             )
                         }.answer
                     }
                     null -> {
+                        val target = createExecutionTarget(selectedChatModel())
                         val answerBuilder = StringBuilder()
-                        client.streamChatCompletion(AppConfig.apiKey, AppConfig.chatModel, chatHistory, temperature).collect { delta ->
+                        target.client.streamChatCompletion(target.apiKey, target.option.name, chatHistory, temperature).collect { delta ->
                             answerBuilder.append(delta)
                             chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
                                 content = answerBuilder.toString()
@@ -408,6 +516,7 @@ private class DesktopClientState(
                 error = null,
                 isRunning = false,
                 usedStrongModel = false,
+                strongModelLabel = null,
             )
         }
 
@@ -429,6 +538,7 @@ private class DesktopClientState(
                 chatImportItems[index] = chatImportItems[index].copy(isRunning = true)
                 val requestId = ++chatRequestCounter
                 val modeLabel = confidenceModeLabel(selectedConfidenceMode.takeIf { isConfidenceEnabled })
+                val requestModel = if (isConfidenceEnabled) selectedWeakModel() else selectedChatModel()
                 val requestHistory = if (selectedConfidenceMode.takeIf { isConfidenceEnabled } == ConfidenceMode.SCORING) {
                     buildScoredLogHistory(history)
                 } else {
@@ -438,7 +548,7 @@ private class DesktopClientState(
                     buildString {
                         appendLine("Request #$requestId")
                         appendLine("Mode: $modeLabel")
-                        appendLine("Model: ${AppConfig.chatModel}")
+                        appendLine("Model: ${requestModel.label}")
                         appendLine("Temperature: $temperature")
                         appendLine("Messages:")
                         requestHistory.forEachIndexed { historyIndex, turn ->
@@ -461,6 +571,7 @@ private class DesktopClientState(
                                     content = response.answer,
                                     confidenceStatus = response.status,
                                     usedStrongModel = response.usedStrongModel,
+                                    strongModelLabel = response.strongModelLabel,
                                 )
                                 chatImportItems[index] = chatImportItems[index].copy(
                                     response = response.answer,
@@ -471,6 +582,7 @@ private class DesktopClientState(
                                     outputTokens = response.outputTokens,
                                     isRunning = false,
                                     usedStrongModel = response.usedStrongModel,
+                                    strongModelLabel = response.strongModelLabel,
                                 )
                             }
                         }
@@ -486,6 +598,7 @@ private class DesktopClientState(
                                     confidenceStatus = response.status,
                                     auxiliaryLines = response.auxiliaryLines,
                                     usedStrongModel = response.usedStrongModel,
+                                    strongModelLabel = response.strongModelLabel,
                                 )
                                 chatImportItems[index] = chatImportItems[index].copy(
                                     response = response.answer,
@@ -497,11 +610,13 @@ private class DesktopClientState(
                                     outputTokens = response.outputTokens,
                                     isRunning = false,
                                     usedStrongModel = response.usedStrongModel,
+                                    strongModelLabel = response.strongModelLabel,
                                 )
                             }
                         }
                         null -> {
-                            client.sendChatCompletionDetailed(AppConfig.apiKey, AppConfig.chatModel, history, temperature)
+                            val target = createExecutionTarget(selectedChatModel())
+                            target.client.sendChatCompletionDetailed(target.apiKey, target.option.name, history, temperature)
                                 .also { response ->
                                     chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
                                         content = response.answer.ifBlank { "-" },
@@ -583,7 +698,8 @@ private class DesktopClientState(
                 }
 
                 runCatching {
-                    client.sendChatCompletion(AppConfig.apiKey, AppConfig.chatModel, history, 1.0)
+                    val target = createExecutionTarget(selectedChatModel())
+                    target.client.sendChatCompletion(target.apiKey, target.option.name, history, 1.0)
                 }.onSuccess { response ->
                     batchItems[index] = batchItems[index].copy(
                         response = response,
@@ -811,19 +927,70 @@ private class DesktopClientState(
         history: List<ChatTurn>,
         temperature: Double,
     ): ConfidenceExecutionResult {
-        val primary = client.sendScoredChatCompletion(
-            apiKey = AppConfig.apiKey,
-            model = AppConfig.chatModel,
-            history = history,
-            temperature = temperature,
-        )
+        val weakTarget = createExecutionTarget(selectedWeakModel())
+        val strongTarget = createExecutionTarget(selectedStrongModel())
+        val primary = runCatching {
+            weakTarget.client.sendScoredChatCompletion(
+                apiKey = weakTarget.apiKey,
+                model = weakTarget.option.name,
+                history = history,
+                temperature = temperature,
+            )
+        }.getOrElse { error ->
+            appendChatLog(
+                buildString {
+                    appendLine("Response #$requestId")
+                    appendLine("Stage: Primary")
+                    appendLine("Model: ${weakTarget.option.label}")
+                    appendLine("Mode: Scoring")
+                    appendLine("Error:")
+                    appendLine(formatLogBlock(error.message ?: "Unknown error"))
+                    append("Escalation #$requestId\n  Reason: Primary model failed.\n  Routing to stronger model: ${strongTarget.option.label}")
+                }
+            )
+            val strong = strongTarget.client.sendScoredChatCompletion(
+                apiKey = strongTarget.apiKey,
+                model = strongTarget.option.name,
+                history = history,
+                temperature = temperature,
+            )
+            logScoringResponse(
+                requestId = requestId,
+                stage = "Strong",
+                model = strongTarget.option.label,
+                response = strong,
+            )
+            return ConfidenceExecutionResult(
+                answer = strong.answer,
+                status = strong.status,
+                auxiliaryLines = emptyList(),
+                inferenceCount = 1,
+                strongModelInferenceCount = 1,
+                inputTokens = strong.usage.inputTokens,
+                outputTokens = strong.usage.outputTokens,
+                usedStrongModel = true,
+                strongModelLabel = strongTarget.option.label,
+            )
+        }
         logScoringResponse(
             requestId = requestId,
             stage = "Primary",
-            model = AppConfig.chatModel,
+            model = weakTarget.option.label,
             response = primary,
         )
-        if (primary.status == ConfidenceStatus.SURE) {
+        val enumOptions = activeScoringEnumOptions()
+        val isEnumValid = enumOptions.isEmpty() || primary.answer.trim() in enumOptions
+        if (enumOptions.isNotEmpty()) {
+            appendChatLog(
+                buildString {
+                    appendLine("Enum validation #$requestId")
+                    appendLine("Allowed values: ${enumOptions.joinToString(", ")}")
+                    appendLine("Answer: ${primary.answer.trim()}")
+                    append("Result: ${if (isEnumValid) "PASS" else "FAIL"}")
+                }
+            )
+        }
+        if (primary.status == ConfidenceStatus.SURE && isEnumValid) {
             return ConfidenceExecutionResult(
                 answer = primary.answer,
                 status = primary.status,
@@ -833,20 +1000,31 @@ private class DesktopClientState(
                 inputTokens = primary.usage.inputTokens,
                 outputTokens = primary.usage.outputTokens,
                 usedStrongModel = false,
+                strongModelLabel = null,
             )
         }
 
-        appendChatLog("Escalation #$requestId\n  Routing to stronger model: $strongChatModel")
-        val strong = client.sendScoredChatCompletion(
-            apiKey = AppConfig.apiKey,
-            model = strongChatModel,
+        val escalationReason = when {
+            primary.status != ConfidenceStatus.SURE && !isEnumValid ->
+                "Primary status is ${primary.status.name}, and answer does not match enum variants."
+            primary.status != ConfidenceStatus.SURE ->
+                "Primary status is ${primary.status.name}."
+            else ->
+                "Primary answer does not match enum variants."
+        }
+        appendChatLog(
+            "Escalation #$requestId\n  Reason: $escalationReason\n  Routing to stronger model: ${strongTarget.option.label}"
+        )
+        val strong = strongTarget.client.sendScoredChatCompletion(
+            apiKey = strongTarget.apiKey,
+            model = strongTarget.option.name,
             history = history,
             temperature = temperature,
         )
         logScoringResponse(
             requestId = requestId,
             stage = "Strong",
-            model = strongChatModel,
+            model = strongTarget.option.label,
             response = strong,
         )
         return ConfidenceExecutionResult(
@@ -858,6 +1036,7 @@ private class DesktopClientState(
             inputTokens = primary.usage.inputTokens + strong.usage.inputTokens,
             outputTokens = primary.usage.outputTokens + strong.usage.outputTokens,
             usedStrongModel = true,
+            strongModelLabel = strongTarget.option.label,
         )
     }
 
@@ -866,16 +1045,18 @@ private class DesktopClientState(
         history: List<ChatTurn>,
         temperature: Double,
     ): ConfidenceExecutionResult {
-        val primary = client.sendRedundantChatCompletion(
-            apiKey = AppConfig.apiKey,
-            model = AppConfig.chatModel,
+        val weakTarget = createExecutionTarget(selectedWeakModel())
+        val strongTarget = createExecutionTarget(selectedStrongModel())
+        val primary = weakTarget.client.sendRedundantChatCompletion(
+            apiKey = weakTarget.apiKey,
+            model = weakTarget.option.name,
             history = history,
             temperature = temperature,
         )
         logRedundancyResponse(
             requestId = requestId,
             stage = "Primary",
-            model = AppConfig.chatModel,
+            model = weakTarget.option.label,
             response = primary,
         )
         if (primary.status == ConfidenceStatus.SURE) {
@@ -888,20 +1069,21 @@ private class DesktopClientState(
                 inputTokens = primary.usage.inputTokens,
                 outputTokens = primary.usage.outputTokens,
                 usedStrongModel = false,
+                strongModelLabel = null,
             )
         }
 
-        appendChatLog("Escalation #$requestId\n  Routing to stronger model: $strongChatModel")
-        val strong = client.sendRedundantChatCompletion(
-            apiKey = AppConfig.apiKey,
-            model = strongChatModel,
+        appendChatLog("Escalation #$requestId\n  Routing to stronger model: ${strongTarget.option.label}")
+        val strong = strongTarget.client.sendRedundantChatCompletion(
+            apiKey = strongTarget.apiKey,
+            model = strongTarget.option.name,
             history = history,
             temperature = temperature,
         )
         logRedundancyResponse(
             requestId = requestId,
             stage = "Strong",
-            model = strongChatModel,
+            model = strongTarget.option.label,
             response = strong,
         )
         return ConfidenceExecutionResult(
@@ -913,6 +1095,7 @@ private class DesktopClientState(
             inputTokens = primary.usage.inputTokens + strong.usage.inputTokens,
             outputTokens = primary.usage.outputTokens + strong.usage.outputTokens,
             usedStrongModel = true,
+            strongModelLabel = strongTarget.option.label,
         )
     }
 
@@ -1212,6 +1395,7 @@ private fun ChatScreen(
     scope: CoroutineScope,
 ) {
     val transcriptState = rememberLazyListState()
+    val pageScrollState = rememberScrollState()
     var conversationFraction by remember { mutableStateOf(0.62f) }
 
     androidx.compose.runtime.LaunchedEffect(
@@ -1223,10 +1407,15 @@ private fun ChatScreen(
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val chatWorkspaceHeight = maxHeight
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(pageScrollState),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
         SectionCard(
             title = "Settings",
             modifier = Modifier.fillMaxWidth(),
@@ -1287,6 +1476,59 @@ private fun ChatScreen(
                     }
                 }
             }
+            if (state.isConfidenceEnabled) {
+                ModelSelectorField(
+                    label = "Weak model",
+                    selectedModel = state.selectedWeakModel(),
+                    options = state.availableModelOptions,
+                    enabled = !state.isChatLoading && !state.isRefreshingModels,
+                    onSelect = { state.selectedWeakModelKey = it.key },
+                )
+                ModelSelectorField(
+                    label = "Strong model",
+                    selectedModel = state.selectedStrongModel(),
+                    options = state.availableModelOptions,
+                    enabled = !state.isChatLoading && !state.isRefreshingModels,
+                    onSelect = { state.selectedStrongModelKey = it.key },
+                )
+                if (state.selectedConfidenceMode == ConfidenceMode.SCORING) {
+                    ScoringEnumValidationBlock(
+                        values = state.scoringEnumOptions,
+                        enabled = !state.isChatLoading,
+                        onAdd = state::addScoringEnumOption,
+                        onValueChange = state::updateScoringEnumOption,
+                    )
+                }
+            } else {
+                ModelSelectorField(
+                    label = "Request model",
+                    selectedModel = state.selectedChatModel(),
+                    options = state.availableModelOptions,
+                    enabled = !state.isChatLoading && !state.isRefreshingModels,
+                    onSelect = { state.selectedChatModelKey = it.key },
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = { state.refreshOllamaModels(scope) },
+                    enabled = !state.isChatLoading && !state.isRefreshingModels,
+                ) {
+                    if (state.isRefreshingModels) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.size(8.dp))
+                    }
+                    Text("Refresh Ollama models")
+                }
+                Text(
+                    text = state.modelCatalogStatus,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
 
         Row(
@@ -1317,7 +1559,7 @@ private fun ChatScreen(
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
+                .height(chatWorkspaceHeight),
         ) {
             val density = LocalDensity.current
             val dividerHeight = 14.dp
@@ -1403,6 +1645,7 @@ private fun ChatScreen(
             }
         }
     }
+}
 }
 
 @Composable
@@ -1988,7 +2231,7 @@ private fun MessageBubble(
                 )
                 if (message.usedStrongModel) {
                     Text(
-                        text = "Strong model: gpt-4.1",
+                        text = "Strong model: ${message.strongModelLabel ?: AppConfig.strongChatModel}",
                         style = MaterialTheme.typography.labelMedium,
                         color = if (isUser) contentColor.copy(alpha = 0.8f) else Color(0xFF9A6700),
                         fontWeight = FontWeight.SemiBold,
@@ -2029,6 +2272,106 @@ private fun MessageBubble(
                     )
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ModelSelectorField(
+    label: String,
+    selectedModel: ModelOption,
+    options: List<ModelOption>,
+    enabled: Boolean,
+    onSelect: (ModelOption) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = { expanded = true },
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = selectedModel.label,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Start,
+                )
+            }
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+            ) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(option.name)
+                                Text(
+                                    text = option.provider.title,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        },
+                        onClick = {
+                            onSelect(option)
+                            expanded = false
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScoringEnumValidationBlock(
+    values: List<String>,
+    enabled: Boolean,
+    onAdd: () -> Unit,
+    onValueChange: (Int, String) -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Enum validation",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+            OutlinedButton(
+                onClick = onAdd,
+                enabled = enabled,
+            ) {
+                Text("+")
+            }
+        }
+        values.forEachIndexed { index, value ->
+            OutlinedTextField(
+                value = value,
+                onValueChange = { onValueChange(index, it) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = enabled,
+                label = { Text("Enum value ${index + 1}") },
+                singleLine = true,
+            )
         }
     }
 }

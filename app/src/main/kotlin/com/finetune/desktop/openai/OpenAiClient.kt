@@ -82,7 +82,7 @@ class OpenAiClient(
         .build()
 
     suspend fun sendChatCompletion(
-        apiKey: String,
+        apiKey: String?,
         model: String,
         history: List<ChatTurn>,
         temperature: Double,
@@ -95,7 +95,7 @@ class OpenAiClient(
     }
 
     suspend fun sendChatCompletionDetailed(
-        apiKey: String,
+        apiKey: String?,
         model: String,
         history: List<ChatTurn>,
         temperature: Double,
@@ -115,7 +115,7 @@ class OpenAiClient(
     }
 
     suspend fun sendScoredChatCompletion(
-        apiKey: String,
+        apiKey: String?,
         model: String,
         history: List<ChatTurn>,
         temperature: Double,
@@ -130,7 +130,7 @@ class OpenAiClient(
     }
 
     suspend fun sendRedundantChatCompletion(
-        apiKey: String,
+        apiKey: String?,
         model: String,
         history: List<ChatTurn>,
         temperature: Double,
@@ -142,7 +142,7 @@ class OpenAiClient(
     }
 
     fun streamChatCompletion(
-        apiKey: String,
+        apiKey: String?,
         model: String,
         history: List<ChatTurn>,
         temperature: Double,
@@ -184,7 +184,7 @@ class OpenAiClient(
     }.flowOn(Dispatchers.IO)
 
     suspend fun uploadTrainingFile(
-        apiKey: String,
+        apiKey: String?,
         datasetFile: File,
     ): String {
         require(datasetFile.exists()) { "Dataset file does not exist." }
@@ -219,7 +219,7 @@ class OpenAiClient(
     }
 
     suspend fun createFineTuneJob(
-        apiKey: String,
+        apiKey: String?,
         model: String,
         trainingFileId: String,
     ): FineTuneJobInfo {
@@ -240,7 +240,7 @@ class OpenAiClient(
     }
 
     suspend fun retrieveFineTuneJob(
-        apiKey: String,
+        apiKey: String?,
         jobId: String,
     ): FineTuneJobInfo {
         val request = baseRequest(apiKey, "/fine_tuning/jobs/$jobId")
@@ -262,7 +262,7 @@ class OpenAiClient(
     }
 
     private suspend fun sendJsonRequest(
-        apiKey: String,
+        apiKey: String?,
         endpoint: String,
         payload: String,
     ): String {
@@ -274,11 +274,13 @@ class OpenAiClient(
         return execute(request)
     }
 
-    private fun baseRequest(apiKey: String, endpoint: String): HttpRequest.Builder {
-        require(apiKey.isNotBlank()) { "OpenAI API token is required." }
-        return HttpRequest.newBuilder(URI("$baseUrl$endpoint"))
+    private fun baseRequest(apiKey: String?, endpoint: String): HttpRequest.Builder {
+        val request = HttpRequest.newBuilder(URI("$baseUrl$endpoint"))
             .timeout(Duration.ofMinutes(2))
-            .header("Authorization", "Bearer $apiKey")
+        if (!apiKey.isNullOrBlank()) {
+            request.header("Authorization", "Bearer $apiKey")
+        }
+        return request
     }
 
     private suspend fun execute(request: HttpRequest): String {

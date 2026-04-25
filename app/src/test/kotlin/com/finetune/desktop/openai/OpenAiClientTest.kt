@@ -49,7 +49,11 @@ class OpenAiClientTest {
     @Test
     fun `parse redundant chat response returns sure when all responses match`() {
         val parsed = client.parseRedundantChatResponse(
-            listOf("Same answer.", "Same answer.", "Same answer.")
+            listOf(
+                ChatCompletionResult("Same answer.", TokenUsage(1, 1), "{}"),
+                ChatCompletionResult("Same answer.", TokenUsage(1, 1), "{}"),
+                ChatCompletionResult("Same answer.", TokenUsage(1, 1), "{}"),
+            )
         )
 
         assertEquals(ConfidenceStatus.SURE, parsed.status)
@@ -59,7 +63,11 @@ class OpenAiClientTest {
     @Test
     fun `parse redundant chat response returns fail when responses differ`() {
         val parsed = client.parseRedundantChatResponse(
-            listOf("First answer.", "Second answer.", "First answer.")
+            listOf(
+                ChatCompletionResult("First answer.", TokenUsage(1, 1), "{}"),
+                ChatCompletionResult("Second answer.", TokenUsage(1, 1), "{}"),
+                ChatCompletionResult("First answer.", TokenUsage(1, 1), "{}"),
+            )
         )
 
         assertEquals(ConfidenceStatus.FAIL, parsed.status)
