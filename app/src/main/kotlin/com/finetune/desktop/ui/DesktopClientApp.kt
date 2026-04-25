@@ -83,9 +83,16 @@ import com.finetune.desktop.openai.ModelOption
 import com.finetune.desktop.openai.ModelProvider
 import com.finetune.desktop.openai.OpenAiClient
 import com.finetune.desktop.openai.OllamaClient
+import com.finetune.desktop.supporttriage.SupportStatus
+import com.finetune.desktop.supporttriage.SupportTriageMetrics
+import com.finetune.desktop.supporttriage.SupportTriagePipeline
+import com.finetune.desktop.supporttriage.SupportTriageRunResult
+import com.finetune.desktop.supporttriage.SupportTriageRunner
+import com.finetune.desktop.supporttriage.buildSupportTriageMetrics
 import com.finetune.desktop.validation.DatasetValidator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -100,6 +107,7 @@ import javax.swing.filechooser.FileNameExtensionFilter
 private enum class DesktopTab(val title: String) {
     CHAT("Chat"),
     BATCH("Batch run"),
+    SUPPORT_TRIAGE("Support triage"),
     FINE_TUNE("Fine-tune"),
     VALIDATE("Validate dataset"),
 }
@@ -193,6 +201,13 @@ private data class BatchPromptItem(
     val wasRequested: Boolean = false,
 )
 
+private data class SupportTriageComparisonItem(
+    val input: String,
+    val monolithic: SupportTriageRunResult? = null,
+    val multiStage: SupportTriageRunResult? = null,
+    val isRunning: Boolean = false,
+)
+
 private class DesktopClientState(
     private val client: OpenAiClient = OpenAiClient(),
 ) {
@@ -242,6 +257,23 @@ private class DesktopClientState(
     var batchSummary by mutableStateOf("Select a dataset to load user prompts.")
     var isBatchRunning by mutableStateOf(false)
 
+    var supportTriageInput by mutableStateOf(
+        """
+        После оплаты подписка не появилась, деньги списались. Верните деньги или подключите доступ.
+        Не могу войти в аккаунт, код подтверждения не приходит уже час.
+        Подскажите, как отменить автопродление подписки?
+        Спасибо, все работает отлично.
+        """.trimIndent()
+    )
+    var supportTriageJsonPath by mutableStateOf("")
+    val supportTriageItems = mutableStateListOf<SupportTriageComparisonItem>()
+    var supportTriageSummary by mutableStateOf("Enter one support request per line and run comparison.")
+    var isSupportTriageRunning by mutableStateOf(false)
+    var supportTriageMonolithicMetrics by mutableStateOf<SupportTriageMetrics?>(null)
+    var supportTriageMultiStageMetrics by mutableStateOf<SupportTriageMetrics?>(null)
+    val supportTriageLogs = mutableStateListOf<String>()
+    private var supportTriageJob: Job? = null
+
     var validationDatasetPath by mutableStateOf("")
     var validationSummary by mutableStateOf("Select a dataset and start validation.")
     var validationDetails by mutableStateOf("")
@@ -252,6 +284,7 @@ private class DesktopClientState(
 
     fun dispose() {
         pollingJob?.cancel()
+        supportTriageJob?.cancel()
     }
 
     fun selectedChatModel(): ModelOption = resolveModelOption(selectedChatModelKey)
@@ -361,6 +394,88 @@ private class DesktopClientState(
     }
 
     fun selectedBatchCount(): Int = batchItems.count { it.selected }
+
+    fun runSupportTriage(scope: CoroutineScope) {
+        if (isSupportTriageRunning) return
+        val inputs = supportTriageInput
+            .lines()
+            .map(String::trim)
+            .filter(String::isNotBlank)
+        if (inputs.isEmpty()) {
+            dialogMessage = "Enter at least one support request."
+            return
+        }
+
+        val target = createExecutionTarget(selectedChatModel())
+        val runner = SupportTriageRunner { history, temperature ->
+            target.client.sendChatCompletionDetailed(target.apiKey, target.option.name, history, temperature)
+        }
+        supportTriageItems.clear()
+        supportTriageItems.addAll(inputs.map { SupportTriageComparisonItem(input = it) })
+        supportTriageMonolithicMetrics = null
+        supportTriageMultiStageMetrics = null
+        supportTriageLogs.clear()
+        supportTriageSummary = "Running ${inputs.size} support triage request(s) with ${target.option.label}..."
+        isSupportTriageRunning = true
+
+        supportTriageJob = scope.launch {
+            val results = mutableListOf<SupportTriageRunResult>()
+            runCatching {
+                inputs.forEachIndexed { index, input ->
+                    if (!isActive) throw CancellationException("Support triage run was stopped.")
+                    supportTriageItems[index] = supportTriageItems[index].copy(isRunning = true)
+                    supportTriageLogs += "Request ${index + 1}: monolithic started."
+                    val monolithic = runner.runMonolithic(input)
+                    results += monolithic
+                    supportTriageItems[index] = supportTriageItems[index].copy(monolithic = monolithic)
+                    supportTriageLogs += formatSupportTriageLog(index + 1, monolithic)
+
+                    if (!isActive) throw CancellationException("Support triage run was stopped.")
+                    supportTriageLogs += "Request ${index + 1}: multi-stage started."
+                    val multiStage = runner.runMultiStage(input)
+                    results += multiStage
+                    supportTriageItems[index] = supportTriageItems[index].copy(
+                        multiStage = multiStage,
+                        isRunning = false,
+                    )
+                    supportTriageLogs += formatSupportTriageLog(index + 1, multiStage)
+                }
+                supportTriageSummary = "Completed ${inputs.size} support triage comparison(s)."
+            }.onFailure { error ->
+                if (error is CancellationException) {
+                    supportTriageLogs += "Run stopped by user."
+                    supportTriageSummary = "Stopped. Completed ${results.count { it.pipeline == SupportTriagePipeline.MONOLITHIC }} monolithic and ${results.count { it.pipeline == SupportTriagePipeline.MULTI_STAGE }} multi-stage run(s)."
+                } else {
+                    supportTriageLogs += "Run failed: ${error.message ?: "Unknown error"}"
+                    supportTriageSummary = "Support triage run failed."
+                }
+            }
+
+            supportTriageItems.indices.forEach { index ->
+                if (supportTriageItems[index].isRunning) {
+                    supportTriageItems[index] = supportTriageItems[index].copy(isRunning = false)
+                }
+            }
+            supportTriageMonolithicMetrics = buildSupportTriageMetrics(results, SupportTriagePipeline.MONOLITHIC)
+            supportTriageMultiStageMetrics = buildSupportTriageMetrics(results, SupportTriagePipeline.MULTI_STAGE)
+            isSupportTriageRunning = false
+            supportTriageJob = null
+        }
+    }
+
+    fun stopSupportTriage() {
+        if (!isSupportTriageRunning) return
+        supportTriageSummary = "Stopping support triage run..."
+        supportTriageLogs += "Stop requested."
+        supportTriageJob?.cancel(CancellationException("Support triage run stopped by user."))
+    }
+
+    fun browseSupportTriageJsonFile() {
+        chooseJsonFile(supportTriageJsonPath)?.let { file ->
+            supportTriageJsonPath = file.absolutePath
+            loadSupportTriageRequests(file)
+        }
+    }
 
     fun sendChat(scope: CoroutineScope) {
         val promptText = prompt.trim()
@@ -891,6 +1006,23 @@ private class DesktopClientState(
             .joinToString(separator = "\n") { "  $it" }
     }
 
+    private fun formatSupportTriageLog(requestNumber: Int, result: SupportTriageRunResult): String {
+        return buildString {
+            appendLine("Request $requestNumber: ${result.pipeline.name}")
+            appendLine("Latency: ${result.totalLatencyMs} ms")
+            appendLine("Inferences: ${result.modelInferences}")
+            appendLine("Tokens: input=${result.usage.inputTokens}, output=${result.usage.outputTokens}")
+            appendLine("Parsing errors: ${result.parsingErrors}")
+            result.finalResult?.let { final ->
+                appendLine("Final: ${final.status.name} ${final.intent.name}/${final.sentiment.name}/${final.urgency.name}, confidence=${"%.3f".format(java.util.Locale.US, final.confidence)}, needs_human=${final.needsHuman}")
+            } ?: appendLine("Final: FAIL")
+            result.stages.forEach { stage ->
+                appendLine("${stage.name}: ${if (stage.valid) "OK" else "FAIL"} (${stage.latencyMs} ms)")
+                stage.error?.let { appendLine("  Error: $it") }
+            }
+        }.trimEnd()
+    }
+
     private fun parseChatTemperatureOrShowError(): Double? {
         val temperature = chatTemperature.trim().toDoubleOrNull()
         if (temperature == null || temperature !in 0.0..2.0) {
@@ -1198,6 +1330,34 @@ private class DesktopClientState(
         }
     }
 
+    private fun loadSupportTriageRequests(file: File) {
+        runCatching {
+            val root = json.parseToJsonElement(file.readText())
+            root.jsonArray.mapIndexed { index, element ->
+                val request = element.jsonPrimitive.contentOrNull?.trim()
+                    ?: throw IllegalArgumentException("Item ${index + 1} must be a string.")
+                if (request.isBlank()) {
+                    throw IllegalArgumentException("Item ${index + 1} must not be blank.")
+                }
+                request
+            }
+        }.onSuccess { requests ->
+            supportTriageInput = requests.joinToString(separator = "\n")
+            supportTriageItems.clear()
+            supportTriageMonolithicMetrics = null
+            supportTriageMultiStageMetrics = null
+            supportTriageLogs.clear()
+            supportTriageSummary = if (requests.isEmpty()) {
+                "JSON file does not contain any support requests."
+            } else {
+                "Loaded ${requests.size} support request(s) from ${file.name}."
+            }
+        }.onFailure { error ->
+            supportTriageSummary = "Failed to load support requests."
+            dialogMessage = error.message ?: "Failed to parse support requests."
+        }
+    }
+
     private fun buildChatImportMetrics(): ChatImportMetrics {
         val statusCounts = chatImportItems.mapNotNull { it.confidenceStatus }
             .groupingBy { it }
@@ -1366,6 +1526,7 @@ fun FineTuneDesktopApp() {
                     when (state.selectedTab) {
                         DesktopTab.CHAT -> ChatScreen(state = state, scope = scope)
                         DesktopTab.BATCH -> BatchRunScreen(state = state, scope = scope)
+                        DesktopTab.SUPPORT_TRIAGE -> SupportTriageScreen(state = state, scope = scope)
                         DesktopTab.FINE_TUNE -> FineTuneScreen(state = state, scope = scope)
                         DesktopTab.VALIDATE -> ValidationScreen(state = state, scope = scope)
                     }
@@ -2007,6 +2168,284 @@ private fun BatchResultBlock(
             )
             SelectionContainer {
                 Text(text = content)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SupportTriageScreen(
+    state: DesktopClientState,
+    scope: CoroutineScope,
+) {
+    val scrollState = rememberScrollState()
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(scrollState),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        SectionCard(
+            title = "Multi-stage support triage",
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            ModelSelectorField(
+                label = "Request model",
+                selectedModel = state.selectedChatModel(),
+                options = state.availableModelOptions,
+                enabled = !state.isSupportTriageRunning && !state.isRefreshingModels,
+                onSelect = { state.selectedChatModelKey = it.key },
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedButton(
+                    onClick = { state.refreshOllamaModels(scope) },
+                    enabled = !state.isSupportTriageRunning && !state.isRefreshingModels,
+                ) {
+                    if (state.isRefreshingModels) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.size(8.dp))
+                    }
+                    Text("Refresh Ollama models")
+                }
+                Text(
+                    text = state.modelCatalogStatus,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            FilePickerField(
+                label = "Requests JSON",
+                path = state.supportTriageJsonPath,
+                onBrowse = state::browseSupportTriageJsonFile,
+                enabled = !state.isSupportTriageRunning,
+                buttonLabel = "Import JSON",
+            )
+            OutlinedTextField(
+                value = state.supportTriageInput,
+                onValueChange = { state.supportTriageInput = it },
+                modifier = Modifier.fillMaxWidth().height(190.dp),
+                enabled = !state.isSupportTriageRunning,
+                label = { Text("Support requests, one per line") },
+            )
+            Text(
+                text = state.supportTriageSummary,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (state.isSupportTriageRunning) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.size(10.dp))
+                    OutlinedButton(
+                        onClick = state::stopSupportTriage,
+                        enabled = true,
+                    ) {
+                        Text("Stop")
+                    }
+                    Spacer(modifier = Modifier.size(8.dp))
+                }
+                Button(
+                    onClick = { state.runSupportTriage(scope) },
+                    enabled = !state.isSupportTriageRunning,
+                ) {
+                    Text("Run comparison")
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            state.supportTriageMonolithicMetrics?.let { metrics ->
+                SupportTriageMetricsCard(
+                    title = "Monolithic metrics",
+                    metrics = metrics,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            state.supportTriageMultiStageMetrics?.let { metrics ->
+                SupportTriageMetricsCard(
+                    title = "Multi-stage metrics",
+                    metrics = metrics,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+
+        SectionCard(
+            title = "Comparison results",
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(560.dp),
+        ) {
+            if (state.supportTriageItems.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "No support triage runs yet.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(vertical = 2.dp),
+                ) {
+                    itemsIndexed(state.supportTriageItems) { index, item ->
+                        SupportTriageComparisonCard(index = index + 1, item = item)
+                    }
+                }
+            }
+        }
+
+        SectionCard(
+            title = "Stage log",
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(360.dp),
+        ) {
+            LogPanel(
+                lines = state.supportTriageLogs,
+                placeholder = "No support triage logs yet.",
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun SupportTriageMetricsCard(
+    title: String,
+    metrics: SupportTriageMetrics,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            Text("Total requests: ${metrics.totalRequests}")
+            Text("Successful: ${metrics.successful}")
+            Text("Unsuccessful: ${metrics.unsuccessful}")
+            Text("Model inferences: ${metrics.modelInferences}")
+            Text("Failed stages: ${metrics.failedStages}")
+            Text("Parsing errors: ${metrics.parsingErrors}")
+            Text("Tokens: input=${metrics.inputTokens}, output=${metrics.outputTokens}")
+            Text("Latency: avg=${metrics.averageLatencyMs} ms, total=${metrics.totalLatencyMs} ms")
+            Text("Status counts: OK=${metrics.okCount}, UNSURE=${metrics.unsureCount}, FAIL=${metrics.failCount}")
+            if (metrics.stage1Failures + metrics.stage2Failures + metrics.stage3Failures > 0 ||
+                metrics.averageStage1LatencyMs + metrics.averageStage2LatencyMs + metrics.averageStage3LatencyMs > 0
+            ) {
+                Text("Stage failures: s1=${metrics.stage1Failures}, s2=${metrics.stage2Failures}, s3=${metrics.stage3Failures}")
+                Text("Stage avg latency: s1=${metrics.averageStage1LatencyMs} ms, s2=${metrics.averageStage2LatencyMs} ms, s3=${metrics.averageStage3LatencyMs} ms")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SupportTriageComparisonCard(
+    index: Int,
+    item: SupportTriageComparisonItem,
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "Request $index",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.secondary,
+                fontWeight = FontWeight.SemiBold,
+            )
+            SelectionContainer {
+                Text(text = item.input, style = MaterialTheme.typography.bodyLarge)
+            }
+            if (item.isRunning) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Text("Running comparison...")
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                SupportTriageResultBlock(
+                    title = "Monolithic",
+                    result = item.monolithic,
+                    modifier = Modifier.weight(1f),
+                )
+                SupportTriageResultBlock(
+                    title = "Multi-stage",
+                    result = item.multiStage,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SupportTriageResultBlock(
+    title: String,
+    result: SupportTriageRunResult?,
+    modifier: Modifier = Modifier,
+) {
+    val status = result?.finalResult?.status
+    val color = when (status) {
+        SupportStatus.OK -> Color(0xFFE8F4EE)
+        SupportStatus.UNSURE -> Color(0xFFFFF3CD)
+        SupportStatus.FAIL, null -> Color(0xFFFDECEC)
+    }
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = color),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            if (result == null) {
+                Text("Not run yet.")
+            } else {
+                Text("Latency: ${result.totalLatencyMs} ms; inferences: ${result.modelInferences}")
+                Text("Tokens: input=${result.usage.inputTokens}, output=${result.usage.outputTokens}")
+                Text("Failed stages: ${result.stages.count { !it.valid }}; parsing errors: ${result.parsingErrors}")
+                SelectionContainer {
+                    Text(result.finalResult?.toJsonString() ?: "FAIL")
+                }
             }
         }
     }
