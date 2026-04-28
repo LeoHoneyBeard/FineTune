@@ -101,6 +101,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-jdk8:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.1")
+    implementation("org.apache.poi:poi-ooxml:5.2.5")
     testImplementation(kotlin("test"))
 }
 
