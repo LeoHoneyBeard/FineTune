@@ -238,6 +238,7 @@ private class DesktopClientState(
     val chatLogs = mutableStateListOf<String>()
     private val chatHistory = mutableListOf<ChatTurn>()
     private var chatRequestCounter = 0
+    private var chatJob: Job? = null
     var isChatLoading by mutableStateOf(false)
     var isConfidenceEnabled by mutableStateOf(false)
     var selectedConfidenceMode by mutableStateOf(ConfidenceMode.SCORING)
@@ -284,6 +285,7 @@ private class DesktopClientState(
 
     fun dispose() {
         pollingJob?.cancel()
+        chatJob?.cancel()
         supportTriageJob?.cancel()
     }
 
@@ -478,6 +480,7 @@ private class DesktopClientState(
     }
 
     fun sendChat(scope: CoroutineScope) {
+        if (isChatLoading) return
         val promptText = prompt.trim()
         val systemPromptText = systemPrompt.trim()
         val temperature = parseChatTemperatureOrShowError() ?: return
@@ -527,8 +530,9 @@ private class DesktopClientState(
             }.trimEnd()
         )
 
-        scope.launch {
+        chatJob = scope.launch {
             val confidenceMode = selectedConfidenceMode.takeIf { isConfidenceEnabled }
+            var partialAnswer = ""
             runCatching {
                 when (confidenceMode) {
                     ConfidenceMode.SCORING -> {
@@ -538,6 +542,7 @@ private class DesktopClientState(
                             temperature = temperature,
                             mode = ConfidenceMode.SCORING,
                         ).also { response ->
+                            partialAnswer = response.answer
                             chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
                                 content = response.answer,
                                 confidenceStatus = response.status,
@@ -553,6 +558,7 @@ private class DesktopClientState(
                             temperature = temperature,
                             mode = ConfidenceMode.REDUNDANCY,
                         ).also { response ->
+                            partialAnswer = response.answer
                             chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
                                 content = response.answer,
                                 confidenceStatus = response.status,
@@ -567,6 +573,7 @@ private class DesktopClientState(
                         val answerBuilder = StringBuilder()
                         target.client.streamChatCompletion(target.apiKey, target.option.name, chatHistory, temperature).collect { delta ->
                             answerBuilder.append(delta)
+                            partialAnswer = answerBuilder.toString()
                             chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
                                 content = answerBuilder.toString()
                             )
@@ -586,27 +593,51 @@ private class DesktopClientState(
             }.onSuccess { answer ->
                 chatHistory += ChatTurn("assistant", answer)
                 isChatLoading = false
+                chatJob = null
             }.onFailure { error ->
-                chatHistory.removeLastOrNull()
-                chatMessages[assistantIndex] = TranscriptMessage(
-                    role = TranscriptRole.ASSISTANT,
-                    speaker = "Model",
-                    content = "Error:\n${error.message ?: "Unknown error"}",
-                )
-                appendChatLog(
-                    buildString {
-                        appendLine("Response #$requestId")
-                        appendLine("Mode: $modeLabel")
-                        appendLine("Error:")
-                        append(formatLogBlock(error.message ?: "Unknown error"))
-                    }.trimEnd()
-                )
+                if (error is CancellationException) {
+                    val stoppedContent = partialAnswer.ifBlank { "Stopped by user." }
+                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(content = stoppedContent)
+                    if (partialAnswer.isNotBlank()) {
+                        chatHistory += ChatTurn("assistant", partialAnswer)
+                    } else {
+                        chatHistory.removeLastOrNull()
+                    }
+                    appendChatLog(
+                        buildString {
+                            appendLine("Response #$requestId")
+                            appendLine("Mode: $modeLabel")
+                            appendLine("Stopped by user.")
+                            if (partialAnswer.isNotBlank()) {
+                                appendLine("Partial answer:")
+                                append(formatLogBlock(partialAnswer))
+                            }
+                        }.trimEnd()
+                    )
+                } else {
+                    chatHistory.removeLastOrNull()
+                    chatMessages[assistantIndex] = TranscriptMessage(
+                        role = TranscriptRole.ASSISTANT,
+                        speaker = "Model",
+                        content = "Error:\n${error.message ?: "Unknown error"}",
+                    )
+                    appendChatLog(
+                        buildString {
+                            appendLine("Response #$requestId")
+                            appendLine("Mode: $modeLabel")
+                            appendLine("Error:")
+                            append(formatLogBlock(error.message ?: "Unknown error"))
+                        }.trimEnd()
+                    )
+                }
                 isChatLoading = false
+                chatJob = null
             }
         }
     }
 
     fun runImportedChat(scope: CoroutineScope) {
+        if (isChatLoading) return
         val temperature = parseChatTemperatureOrShowError() ?: return
         if (chatImportItems.isEmpty()) {
             dialogMessage = "Select a JSON file with prompts before running import."
@@ -635,151 +666,183 @@ private class DesktopClientState(
             )
         }
 
-        scope.launch {
-            chatImportItems.forEachIndexed { index, item ->
-                val history = buildChatPromptHistory(item.prompt)
-                val userMessageIndex = chatMessages.size
-                chatMessages += TranscriptMessage(
-                    role = TranscriptRole.USER,
-                    speaker = "You",
-                    content = item.prompt,
-                )
-                val assistantIndex = chatMessages.size
-                chatMessages += TranscriptMessage(
-                    role = TranscriptRole.ASSISTANT,
-                    speaker = "Model",
-                    content = "",
-                )
-                chatImportItems[index] = chatImportItems[index].copy(isRunning = true)
-                val requestId = ++chatRequestCounter
-                val modeLabel = confidenceModeLabel(selectedConfidenceMode.takeIf { isConfidenceEnabled })
-                val requestModel = if (isConfidenceEnabled) selectedWeakModel() else selectedChatModel()
-                val requestHistory = if (selectedConfidenceMode.takeIf { isConfidenceEnabled } == ConfidenceMode.SCORING) {
-                    buildScoredLogHistory(history)
-                } else {
-                    history
-                }
-                appendChatLog(
-                    buildString {
-                        appendLine("Request #$requestId")
-                        appendLine("Mode: $modeLabel")
-                        appendLine("Model: ${requestModel.label}")
-                        appendLine("Temperature: $temperature")
-                        appendLine("Messages:")
-                        requestHistory.forEachIndexed { historyIndex, turn ->
-                            appendLine("${historyIndex + 1}. ${turn.role.uppercase()}")
-                            appendLine(formatLogBlock(turn.content))
-                        }
-                    }.trimEnd()
-                )
-
-                runCatching {
-                    when (val confidenceMode = selectedConfidenceMode.takeIf { isConfidenceEnabled }) {
-                        ConfidenceMode.SCORING -> {
-                            executeConfidenceRoute(
-                                requestId = requestId,
-                                history = history,
-                                temperature = temperature,
-                                mode = confidenceMode,
-                            ).also { response ->
-                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                    content = response.answer,
-                                    confidenceStatus = response.status,
-                                    usedStrongModel = response.usedStrongModel,
-                                    strongModelLabel = response.strongModelLabel,
-                                )
-                                chatImportItems[index] = chatImportItems[index].copy(
-                                    response = response.answer,
-                                    confidenceStatus = response.status,
-                                    inferenceCount = response.inferenceCount,
-                                    strongModelInferenceCount = response.strongModelInferenceCount,
-                                    inputTokens = response.inputTokens,
-                                    outputTokens = response.outputTokens,
-                                    isRunning = false,
-                                    usedStrongModel = response.usedStrongModel,
-                                    strongModelLabel = response.strongModelLabel,
-                                )
-                            }
-                        }
-                        ConfidenceMode.REDUNDANCY -> {
-                            executeConfidenceRoute(
-                                requestId = requestId,
-                                history = history,
-                                temperature = temperature,
-                                mode = confidenceMode,
-                            ).also { response ->
-                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                    content = response.answer,
-                                    confidenceStatus = response.status,
-                                    auxiliaryLines = response.auxiliaryLines,
-                                    usedStrongModel = response.usedStrongModel,
-                                    strongModelLabel = response.strongModelLabel,
-                                )
-                                chatImportItems[index] = chatImportItems[index].copy(
-                                    response = response.answer,
-                                    confidenceStatus = response.status,
-                                    auxiliaryLines = response.auxiliaryLines,
-                                    inferenceCount = response.inferenceCount,
-                                    strongModelInferenceCount = response.strongModelInferenceCount,
-                                    inputTokens = response.inputTokens,
-                                    outputTokens = response.outputTokens,
-                                    isRunning = false,
-                                    usedStrongModel = response.usedStrongModel,
-                                    strongModelLabel = response.strongModelLabel,
-                                )
-                            }
-                        }
-                        null -> {
-                            val target = createExecutionTarget(selectedChatModel())
-                            target.client.sendChatCompletionDetailed(target.apiKey, target.option.name, history, temperature)
-                                .also { response ->
-                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                        content = response.answer.ifBlank { "-" },
-                                    )
-                                    chatImportItems[index] = chatImportItems[index].copy(
-                                        response = response.answer.ifBlank { "-" },
-                                        inferenceCount = 1,
-                                        inputTokens = response.usage.inputTokens,
-                                        outputTokens = response.usage.outputTokens,
-                                        isRunning = false,
-                                    )
-                                    appendChatLog(
-                                        buildString {
-                                            appendLine("Response #$requestId")
-                                            appendLine("Mode: Standard")
-                                            appendLine("Answer:")
-                                            append(formatLogBlock(response.answer))
-                                        }.trimEnd()
-                                    )
-                                }
-                        }
-                    }
-                }.onFailure { error ->
-                    chatMessages[assistantIndex] = TranscriptMessage(
+        chatJob = scope.launch {
+            try {
+                chatImportItems.forEachIndexed { index, item ->
+                    if (!isActive) throw CancellationException("Chat import stopped by user.")
+                    val history = buildChatPromptHistory(item.prompt)
+                    chatMessages += TranscriptMessage(
+                        role = TranscriptRole.USER,
+                        speaker = "You",
+                        content = item.prompt,
+                    )
+                    val assistantIndex = chatMessages.size
+                    chatMessages += TranscriptMessage(
                         role = TranscriptRole.ASSISTANT,
                         speaker = "Model",
-                        content = "Error:\n${error.message ?: "Unknown error"}",
+                        content = "",
                     )
-                    chatImportItems[index] = chatImportItems[index].copy(
-                        response = null,
-                        error = error.message ?: "Unknown error",
-                        isRunning = false,
-                    )
+                    chatImportItems[index] = chatImportItems[index].copy(isRunning = true)
+                    val requestId = ++chatRequestCounter
+                    val modeLabel = confidenceModeLabel(selectedConfidenceMode.takeIf { isConfidenceEnabled })
+                    val requestModel = if (isConfidenceEnabled) selectedWeakModel() else selectedChatModel()
+                    val requestHistory = if (selectedConfidenceMode.takeIf { isConfidenceEnabled } == ConfidenceMode.SCORING) {
+                        buildScoredLogHistory(history)
+                    } else {
+                        history
+                    }
                     appendChatLog(
                         buildString {
-                            appendLine("Response #$requestId")
+                            appendLine("Request #$requestId")
                             appendLine("Mode: $modeLabel")
-                            appendLine("Error:")
-                            append(formatLogBlock(error.message ?: "Unknown error"))
+                            appendLine("Model: ${requestModel.label}")
+                            appendLine("Temperature: $temperature")
+                            appendLine("Messages:")
+                            requestHistory.forEachIndexed { historyIndex, turn ->
+                                appendLine("${historyIndex + 1}. ${turn.role.uppercase()}")
+                                appendLine(formatLogBlock(turn.content))
+                            }
                         }.trimEnd()
                     )
-                }
-            }
 
-            chatImportMetrics = buildChatImportMetrics()
-            chatImportSummary = "Completed ${chatImportItems.size} imported prompt(s)."
-            isChatLoading = false
+                    runCatching {
+                        when (val confidenceMode = selectedConfidenceMode.takeIf { isConfidenceEnabled }) {
+                            ConfidenceMode.SCORING -> {
+                                executeConfidenceRoute(
+                                    requestId = requestId,
+                                    history = history,
+                                    temperature = temperature,
+                                    mode = confidenceMode,
+                                ).also { response ->
+                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                        content = response.answer,
+                                        confidenceStatus = response.status,
+                                        usedStrongModel = response.usedStrongModel,
+                                        strongModelLabel = response.strongModelLabel,
+                                    )
+                                    chatImportItems[index] = chatImportItems[index].copy(
+                                        response = response.answer,
+                                        confidenceStatus = response.status,
+                                        inferenceCount = response.inferenceCount,
+                                        strongModelInferenceCount = response.strongModelInferenceCount,
+                                        inputTokens = response.inputTokens,
+                                        outputTokens = response.outputTokens,
+                                        isRunning = false,
+                                        usedStrongModel = response.usedStrongModel,
+                                        strongModelLabel = response.strongModelLabel,
+                                    )
+                                }
+                            }
+                            ConfidenceMode.REDUNDANCY -> {
+                                executeConfidenceRoute(
+                                    requestId = requestId,
+                                    history = history,
+                                    temperature = temperature,
+                                    mode = confidenceMode,
+                                ).also { response ->
+                                    chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                        content = response.answer,
+                                        confidenceStatus = response.status,
+                                        auxiliaryLines = response.auxiliaryLines,
+                                        usedStrongModel = response.usedStrongModel,
+                                        strongModelLabel = response.strongModelLabel,
+                                    )
+                                    chatImportItems[index] = chatImportItems[index].copy(
+                                        response = response.answer,
+                                        confidenceStatus = response.status,
+                                        auxiliaryLines = response.auxiliaryLines,
+                                        inferenceCount = response.inferenceCount,
+                                        strongModelInferenceCount = response.strongModelInferenceCount,
+                                        inputTokens = response.inputTokens,
+                                        outputTokens = response.outputTokens,
+                                        isRunning = false,
+                                        usedStrongModel = response.usedStrongModel,
+                                        strongModelLabel = response.strongModelLabel,
+                                    )
+                                }
+                            }
+                            null -> {
+                                val target = createExecutionTarget(selectedChatModel())
+                                target.client.sendChatCompletionDetailed(target.apiKey, target.option.name, history, temperature)
+                                    .also { response ->
+                                        chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                            content = response.answer.ifBlank { "-" },
+                                        )
+                                        chatImportItems[index] = chatImportItems[index].copy(
+                                            response = response.answer.ifBlank { "-" },
+                                            inferenceCount = 1,
+                                            inputTokens = response.usage.inputTokens,
+                                            outputTokens = response.usage.outputTokens,
+                                            isRunning = false,
+                                        )
+                                        appendChatLog(
+                                            buildString {
+                                                appendLine("Response #$requestId")
+                                                appendLine("Mode: Standard")
+                                                appendLine("Answer:")
+                                                append(formatLogBlock(response.answer))
+                                            }.trimEnd()
+                                        )
+                                    }
+                            }
+                        }
+                    }.onFailure { error ->
+                        chatMessages[assistantIndex] = TranscriptMessage(
+                            role = TranscriptRole.ASSISTANT,
+                            speaker = "Model",
+                            content = if (error is CancellationException) {
+                                "Stopped by user."
+                            } else {
+                                "Error:\n${error.message ?: "Unknown error"}"
+                            },
+                        )
+                        chatImportItems[index] = chatImportItems[index].copy(
+                            response = null,
+                            error = if (error is CancellationException) "Stopped by user." else error.message ?: "Unknown error",
+                            isRunning = false,
+                        )
+                        appendChatLog(
+                            buildString {
+                                appendLine("Response #$requestId")
+                                appendLine("Mode: $modeLabel")
+                                if (error is CancellationException) {
+                                    appendLine("Stopped by user.")
+                                } else {
+                                    appendLine("Error:")
+                                    append(formatLogBlock(error.message ?: "Unknown error"))
+                                }
+                            }.trimEnd()
+                        )
+                        if (error is CancellationException) {
+                            throw error
+                        }
+                    }
+                }
+
+                chatImportSummary = "Completed ${chatImportItems.size} imported prompt(s)."
+            } catch (_: CancellationException) {
+                val completedCount = chatImportItems.count { it.response != null || it.error != null }
+                chatImportSummary = "Stopped. Completed $completedCount of ${chatImportItems.size} imported prompt(s)."
+            } finally {
+                chatImportItems.indices.forEach { index ->
+                    if (chatImportItems[index].isRunning) {
+                        chatImportItems[index] = chatImportItems[index].copy(isRunning = false)
+                    }
+                }
+                chatImportMetrics = buildChatImportMetrics()
+                isChatLoading = false
+                chatJob = null
+            }
         }
+    }
+
+    fun stopChatGeneration() {
+        if (!isChatLoading) return
+        if (chatRunMode == ChatRunMode.IMPORT) {
+            chatImportSummary = "Stopping imported prompt run..."
+        }
+        appendChatLog("Stop requested.")
+        chatJob?.cancel(CancellationException("Chat generation stopped by user."))
     }
 
     fun sendBatch(scope: CoroutineScope) {
@@ -1867,11 +1930,14 @@ private fun ManualChatPane(
                     Text("Clear chat")
                 }
                 Spacer(modifier = Modifier.size(8.dp))
-                Button(
-                    onClick = { state.sendChat(scope) },
-                    enabled = !state.isChatLoading,
-                ) {
-                    Text("Send")
+                if (state.isChatLoading) {
+                    OutlinedButton(onClick = state::stopChatGeneration) {
+                        Text("Stop")
+                    }
+                } else {
+                    Button(onClick = { state.sendChat(scope) }) {
+                        Text("Send")
+                    }
                 }
             }
         }
@@ -1928,11 +1994,17 @@ private fun ImportChatPane(
                     Text("Clear chat")
                 }
                 Spacer(modifier = Modifier.size(8.dp))
-                Button(
-                    onClick = { state.runImportedChat(scope) },
-                    enabled = state.chatImportItems.isNotEmpty() && !state.isChatLoading,
-                ) {
-                    Text("Run import")
+                if (state.isChatLoading) {
+                    OutlinedButton(onClick = state::stopChatGeneration) {
+                        Text("Stop")
+                    }
+                } else {
+                    Button(
+                        onClick = { state.runImportedChat(scope) },
+                        enabled = state.chatImportItems.isNotEmpty(),
+                    ) {
+                        Text("Run import")
+                    }
                 }
             }
         }
