@@ -80,6 +80,7 @@ import com.finetune.desktop.batch.BatchResultExport
 import com.finetune.desktop.openai.ChatTurn
 import com.finetune.desktop.openai.ConfidenceStatus
 import com.finetune.desktop.openai.FineTuneJobInfo
+import com.finetune.desktop.openai.GatewayClient
 import com.finetune.desktop.openai.ModelOption
 import com.finetune.desktop.openai.ModelProvider
 import com.finetune.desktop.openai.OpenAiClient
@@ -364,6 +365,7 @@ private data class SupportTriageComparisonItem(
 private class DesktopClientState(
     private val client: OpenAiClient = OpenAiClient(),
 ) {
+    private val gatewayClient = GatewayClient(AppConfig.gatewayBaseUrl)
     private val ollamaClient = OllamaClient(AppConfig.ollamaBaseUrl)
     private val ollamaChatClient = OpenAiClient(AppConfig.ollamaOpenAiBaseUrl)
     private val sourceHttpClient = HttpClient.newBuilder()
@@ -1000,23 +1002,45 @@ private class DesktopClientState(
                     }
                     null -> {
                         val target = createExecutionTarget(selectedChatModel())
-                        val answerBuilder = StringBuilder()
-                        target.client.streamChatCompletion(target.apiKey, target.option.name, chatHistory, temperature).collect { delta ->
-                            answerBuilder.append(delta)
-                            partialAnswer = answerBuilder.toString()
-                            chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
-                                content = answerBuilder.toString()
+                        if (target.option.provider == ModelProvider.OPENAI) {
+                            val response = gatewayClient.sendChatCompletionDetailed(
+                                model = target.option.name,
+                                history = chatHistory,
+                                mode = AppConfig.gatewayMode,
                             )
-                        }
-                        answerBuilder.toString().also { answer ->
+                            partialAnswer = response.answer
+                            chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                content = response.answer.ifBlank { "-" },
+                            )
                             appendChatLog(
                                 buildString {
                                     appendLine("Response #$requestId")
                                     appendLine("Mode: Standard")
+                                    appendLine("Route: Gateway (${AppConfig.gatewayBaseUrl}, ${AppConfig.gatewayMode})")
                                     appendLine("Answer:")
-                                    append(formatLogBlock(answer))
+                                    append(formatLogBlock(response.answer))
                                 }.trimEnd()
                             )
+                            response.answer
+                        } else {
+                            val answerBuilder = StringBuilder()
+                            target.client.streamChatCompletion(target.apiKey, target.option.name, chatHistory, temperature).collect { delta ->
+                                answerBuilder.append(delta)
+                                partialAnswer = answerBuilder.toString()
+                                chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
+                                    content = answerBuilder.toString()
+                                )
+                            }
+                            answerBuilder.toString().also { answer ->
+                                appendChatLog(
+                                    buildString {
+                                        appendLine("Response #$requestId")
+                                        appendLine("Mode: Standard")
+                                        appendLine("Answer:")
+                                        append(formatLogBlock(answer))
+                                    }.trimEnd()
+                                )
+                            }
                         }
                     }
                 }
@@ -1193,7 +1217,16 @@ private class DesktopClientState(
                             }
                             null -> {
                                 val target = createExecutionTarget(selectedChatModel())
-                                target.client.sendChatCompletionDetailed(target.apiKey, target.option.name, history, temperature)
+                                val completion = if (target.option.provider == ModelProvider.OPENAI) {
+                                    gatewayClient.sendChatCompletionDetailed(
+                                        model = target.option.name,
+                                        history = history,
+                                        mode = AppConfig.gatewayMode,
+                                    )
+                                } else {
+                                    target.client.sendChatCompletionDetailed(target.apiKey, target.option.name, history, temperature)
+                                }
+                                completion
                                     .also { response ->
                                         chatMessages[assistantIndex] = chatMessages[assistantIndex].copy(
                                             content = response.answer.ifBlank { "-" },
@@ -1209,6 +1242,9 @@ private class DesktopClientState(
                                             buildString {
                                                 appendLine("Response #$requestId")
                                                 appendLine("Mode: Standard")
+                                                if (target.option.provider == ModelProvider.OPENAI) {
+                                                    appendLine("Route: Gateway (${AppConfig.gatewayBaseUrl}, ${AppConfig.gatewayMode})")
+                                                }
                                                 appendLine("Answer:")
                                                 append(formatLogBlock(response.answer))
                                             }.trimEnd()
@@ -1555,9 +1591,8 @@ private class DesktopClientState(
         val weakTarget = createExecutionTarget(selectedWeakModel())
         val strongTarget = createExecutionTarget(selectedStrongModel())
         val primary = runCatching {
-            weakTarget.client.sendScoredChatCompletion(
-                apiKey = weakTarget.apiKey,
-                model = weakTarget.option.name,
+            sendScoredChatCompletion(
+                target = weakTarget,
                 history = history,
                 temperature = temperature,
             )
@@ -1573,9 +1608,8 @@ private class DesktopClientState(
                     append("Escalation #$requestId\n  Reason: Primary model failed.\n  Routing to stronger model: ${strongTarget.option.label}")
                 }
             )
-            val strong = strongTarget.client.sendScoredChatCompletion(
-                apiKey = strongTarget.apiKey,
-                model = strongTarget.option.name,
+            val strong = sendScoredChatCompletion(
+                target = strongTarget,
                 history = history,
                 temperature = temperature,
             )
@@ -1640,9 +1674,8 @@ private class DesktopClientState(
         appendChatLog(
             "Escalation #$requestId\n  Reason: $escalationReason\n  Routing to stronger model: ${strongTarget.option.label}"
         )
-        val strong = strongTarget.client.sendScoredChatCompletion(
-            apiKey = strongTarget.apiKey,
-            model = strongTarget.option.name,
+        val strong = sendScoredChatCompletion(
+            target = strongTarget,
             history = history,
             temperature = temperature,
         )
@@ -1672,9 +1705,8 @@ private class DesktopClientState(
     ): ConfidenceExecutionResult {
         val weakTarget = createExecutionTarget(selectedWeakModel())
         val strongTarget = createExecutionTarget(selectedStrongModel())
-        val primary = weakTarget.client.sendRedundantChatCompletion(
-            apiKey = weakTarget.apiKey,
-            model = weakTarget.option.name,
+        val primary = sendRedundantChatCompletion(
+            target = weakTarget,
             history = history,
             temperature = temperature,
         )
@@ -1699,9 +1731,8 @@ private class DesktopClientState(
         }
 
         appendChatLog("Escalation #$requestId\n  Routing to stronger model: ${strongTarget.option.label}")
-        val strong = strongTarget.client.sendRedundantChatCompletion(
-            apiKey = strongTarget.apiKey,
-            model = strongTarget.option.name,
+        val strong = sendRedundantChatCompletion(
+            target = strongTarget,
             history = history,
             temperature = temperature,
         )
@@ -1722,6 +1753,48 @@ private class DesktopClientState(
             usedStrongModel = true,
             strongModelLabel = strongTarget.option.label,
         )
+    }
+
+    private suspend fun sendScoredChatCompletion(
+        target: ModelExecutionTarget,
+        history: List<ChatTurn>,
+        temperature: Double,
+    ): com.finetune.desktop.openai.ScoredChatResponse {
+        return if (target.option.provider == ModelProvider.OPENAI) {
+            gatewayClient.sendScoredChatCompletion(
+                model = target.option.name,
+                history = history,
+                mode = AppConfig.gatewayMode,
+            )
+        } else {
+            target.client.sendScoredChatCompletion(
+                apiKey = target.apiKey,
+                model = target.option.name,
+                history = history,
+                temperature = temperature,
+            )
+        }
+    }
+
+    private suspend fun sendRedundantChatCompletion(
+        target: ModelExecutionTarget,
+        history: List<ChatTurn>,
+        temperature: Double,
+    ): com.finetune.desktop.openai.RedundantChatResponse {
+        return if (target.option.provider == ModelProvider.OPENAI) {
+            gatewayClient.sendRedundantChatCompletion(
+                model = target.option.name,
+                history = history,
+                mode = AppConfig.gatewayMode,
+            )
+        } else {
+            target.client.sendRedundantChatCompletion(
+                apiKey = target.apiKey,
+                model = target.option.name,
+                history = history,
+                temperature = temperature,
+            )
+        }
     }
 
     private fun logScoringResponse(
