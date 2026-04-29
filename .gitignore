@@ -22,6 +22,11 @@ local.properties
 .idea/**/usage.statistics.xml
 .run/
 *.log
+gateway/logs/
+gateway/.venv/
+gateway/.pytest_cache/
+gateway/pytest-cache-files-*/
+gateway/**/__pycache__/
 hs_err_pid*
 replay_pid*
 .DS_Store

@@ -42,6 +42,7 @@ fun Properties.optionalLocalProperty(key: String, defaultValue: String): String 
 
 val generateLocalConfig by tasks.registering {
     val outputDir = generatedConfigDir
+    inputs.file(rootProject.file("local.properties"))
     outputs.dir(outputDir)
 
     doLast {
@@ -77,6 +78,8 @@ val generateLocalConfig by tasks.registering {
                 const val chatModel: String = "${escape(localProperties.requiredLocalProperty("openai.chat.model"))}"
                 const val fineTuneModel: String = "${escape(localProperties.requiredLocalProperty("openai.fine_tune.model"))}"
                 const val strongChatModel: String = "${escape(localProperties.optionalLocalProperty("openai.confidence.strong.model", "gpt-4.1"))}"
+                const val gatewayBaseUrl: String = "${escape(localProperties.optionalLocalProperty("llm.gateway.base_url", "http://127.0.0.1:8000").removeSuffix("/"))}"
+                const val gatewayMode: String = "${escape(localProperties.optionalLocalProperty("llm.gateway.mode", "mask"))}"
                 const val ollamaBaseUrl: String = "${escape(ollamaBaseUrl)}"
                 const val ollamaOpenAiBaseUrl: String = "${escape(ollamaOpenAiBaseUrl)}"
             }
