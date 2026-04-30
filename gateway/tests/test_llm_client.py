@@ -29,6 +29,7 @@ async def test_openai_client_retries_transient_disconnect(monkeypatch, tmp_path)
             openai_api_key="sk-test",
             openai_api_base_url="https://api.openai.com/v1",
             audit_log_path=tmp_path / "audit.jsonl",
+            compat_input_mode="block",
         )
     )
 
@@ -61,6 +62,7 @@ async def test_openai_client_retries_429(monkeypatch, tmp_path):
             openai_api_key="sk-test",
             openai_api_base_url="https://api.openai.com/v1",
             audit_log_path=tmp_path / "audit.jsonl",
+            compat_input_mode="block",
         )
     )
 
@@ -82,6 +84,7 @@ async def test_openai_client_does_not_retry_401(monkeypatch, tmp_path):
             openai_api_key="sk-test",
             openai_api_base_url="https://api.openai.com/v1",
             audit_log_path=tmp_path / "audit.jsonl",
+            compat_input_mode="block",
         )
     )
 

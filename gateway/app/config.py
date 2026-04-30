@@ -12,6 +12,7 @@ class Settings:
     openai_api_key: str | None
     openai_api_base_url: str
     audit_log_path: Path
+    compat_input_mode: str
 
 
 def get_settings() -> Settings:
@@ -20,6 +21,9 @@ def get_settings() -> Settings:
         openai_api_key=os.getenv("OPENAI_API_KEY") or read_local_property("openai.api.token"),
         openai_api_base_url=os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com/v1"),
         audit_log_path=Path(audit_log_path) if audit_log_path else GATEWAY_ROOT / "logs" / "audit.jsonl",
+        compat_input_mode=os.getenv("GATEWAY_COMPAT_INPUT_MODE")
+        or read_local_property("llm.gateway.mode")
+        or "block",
     )
 
 

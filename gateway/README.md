@@ -1,6 +1,6 @@
 # FineTune LLM Gateway
 
-Local FastAPI gateway for proxying chat prompts to the OpenAI API with input guards, output guards, redaction, and JSONL audit logs.
+Local FastAPI gateway for proxying chat prompts to the OpenAI API with input guards, output guards, redaction, JSONL audit logs, and OpenAI-compatible `/v1` proxy routes.
 
 ## Setup
 
@@ -35,6 +35,28 @@ pytest
 Tests use a fake LLM client and do not call OpenAI.
 
 ## API
+
+## OpenAI-Compatible Proxy
+
+Point OpenAI-compatible clients at:
+
+```text
+http://127.0.0.1:8000/v1
+```
+
+The gateway forwards `/v1/...` requests to `OPENAI_API_BASE_URL` using the gateway's configured OpenAI API key. The client may send any bearer token; upstream authentication is replaced by the gateway.
+
+Supported compatibility routes are proxied generically, including:
+
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `GET /v1/models`
+
+`POST /v1/chat/completions` and `POST /v1/responses` run the input guard before the upstream call. By default the mode is `block`, so detected secrets return an OpenAI-style error response and are not sent upstream. Set `llm.gateway.mode=mask` in the root `local.properties` to redact chat-completion messages before proxying. `GATEWAY_COMPAT_INPUT_MODE` is still supported as an environment override.
+
+Streaming requests with `"stream": true` are proxied as server-sent event streams.
+
+## FineTune Chat API
 
 `POST /chat`
 
