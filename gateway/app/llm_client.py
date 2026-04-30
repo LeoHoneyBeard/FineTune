@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncIterator, Mapping
 
 import httpx
 
@@ -77,3 +78,84 @@ class OpenAiChatClient:
                 await asyncio.sleep(self._retry_delays[attempt])
 
         raise LlmClientError(f"OpenAI request failed after {attempts} attempts: {last_error}")
+
+
+class OpenAiProxyClient:
+    _hop_by_hop_headers = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "authorization",
+    }
+
+    def __init__(self, settings: Settings):
+        self._settings = settings
+
+    def upstream_url(self, path: str) -> str:
+        return f"{self._settings.openai_api_base_url.rstrip('/')}/{path.lstrip('/')}"
+
+    def upstream_headers(self, incoming_headers: Mapping[str, str]) -> dict[str, str]:
+        if not self._settings.openai_api_key:
+            raise MissingApiKeyError("OpenAI API key is not configured in OPENAI_API_KEY or local.properties")
+
+        headers = {
+            name: value
+            for name, value in incoming_headers.items()
+            if name.lower() not in self._hop_by_hop_headers
+        }
+        headers["Authorization"] = f"Bearer {self._settings.openai_api_key}"
+        return headers
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        query: bytes,
+        body: bytes,
+        incoming_headers: Mapping[str, str],
+    ) -> httpx.Response:
+        headers = self.upstream_headers(incoming_headers)
+        async with httpx.AsyncClient(timeout=None, http2=False) as client:
+            return await client.request(
+                method,
+                self.upstream_url(path),
+                params=query,
+                content=body,
+                headers=headers,
+            )
+
+    async def stream(
+        self,
+        method: str,
+        path: str,
+        query: bytes,
+        body: bytes,
+        incoming_headers: Mapping[str, str],
+    ) -> tuple[httpx.Response, AsyncIterator[bytes]]:
+        headers = self.upstream_headers(incoming_headers)
+        client = httpx.AsyncClient(timeout=None, http2=False)
+        request = client.build_request(
+            method,
+            self.upstream_url(path),
+            params=query,
+            content=body,
+            headers=headers,
+        )
+        response = await client.send(request, stream=True)
+
+        async def chunks() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in response.aiter_raw():
+                    yield chunk
+            finally:
+                await response.aclose()
+                await client.aclose()
+
+        return response, chunks()
